@@ -1,0 +1,19 @@
+.pixi/
+
+# python
+__pycache__/
+*.pyc
+
+data/
+*.parquet
+*.npz
+checkpoints/
+*.pt
+
+.DS_Store
+.vscode/
+.idea/
+
+*.egg-info/
+build/
+dist/
