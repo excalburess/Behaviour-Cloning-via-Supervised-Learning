@@ -3,7 +3,7 @@ import time
 import os
 
 # Headless mode and step cap for CI / direct runs
-headless = os.environ.get("ROBOENV_HEADLESS", "").strip().lower() in ("1", "true", "yes")
+headless = os.environ.get("ROBOENV_HEADLESS", "0").strip().lower() in ("1", "true", "yes")
 max_steps = int(os.environ.get("ROBOENV_MAX_STEPS", "40000"))
 
 import matplotlib
@@ -23,7 +23,7 @@ from robotnik_arm_control import (
 # TARGET SPECIFICATION
 # Fixed 3D Cartesian coordinates for the Kinova end-effector in the world frame:
 # [X (forward/meters), Y (lateral/meters), Z (height/meters)]
-TARGET_EE_POS = np.array([0.0, 1.1, 0.5])
+TARGET_EE_POS = np.array([0.5, 0.1, 0.2])
 
 # Fixed gripper finger configuration (angles in radians, held fixed during simulation):
 # [finger_1, finger_tip_1, finger_2, finger_tip_2, finger_3, finger_tip_3]
