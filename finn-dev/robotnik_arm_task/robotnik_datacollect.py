@@ -76,6 +76,8 @@ def parse_args():
     parser.add_argument("--arm-noise", type=float, default=0.0)
     parser.add_argument("--seed", type=int,default=0)
     parser.add_argument("--out", type=str, default=None)
+    parser.add_argument("--policy", choices=["expert", "mlp"], default="expert")
+    parser.add_argument("--model", type=str, default="model_best.pt")
     return parser.parse_args()
 
 
@@ -213,6 +215,11 @@ def main(args):
     phase_all = []
     done_all = []
 
+    policy = None
+    if args.policy == "mlp":
+        from policy import MLPPolicy          # imported here so expert runs don't need torch
+        policy = MLPPolicy(args.model)
+    min_error = np.inf
     # --------------------------------------------------------------------------
     # Main Simulation Loop
     # --------------------------------------------------------------------------
@@ -239,11 +246,14 @@ def main(args):
         # ----------------------------------------------------------------------
         # 1. Mobile Base Control (Wheel velocities)
         # ----------------------------------------------------------------------
-        wheel_cmds = base_controller(
-            base_state, base_pos, base_bearing, base_goal_pos, base_goal_bearing, current_time, base_params
-        )
-        base_navigation_done = base_state.done
-
+        if policy is None:
+            wheel_cmds = base_controller(
+                base_state, base_pos, base_bearing, base_goal_pos, base_goal_bearing, current_time, base_params
+            )
+            base_navigation_done = base_state.done
+        else:
+            wheel_cmds, torque_arm = policy(base_pos, base_bearing, q_mes, qd_mes,
+            ee_pos, target, current_time)
         # ----------------------------------------------------------------------
         # 2. Arm Control (reaching via differential IK + gravity-compensated joint PD)
         # ----------------------------------------------------------------------
@@ -282,10 +292,15 @@ def main(args):
             break
 
         # Stop criteria: maximum steps, target reached within fine tolerance, or unreachable target
-        stop_message = check_stop(stop_criteria, current_time, time_step, ee_dist_error, base_navigation_done)
-        if stop_message:
-            print(stop_message)
-            break
+        min_error = min(min_error, ee_dist_error)
+        if policy is None:
+            stop_message = check_stop(stop_criteria, current_time, time_step, ee_dist_error, base_navigation_done)
+        else:
+            stop_message = None
+            if ee_dist_error < REACH_TOLERANCE:
+                stop_message = f"Target reached at t={current_time:.2f}s"
+            elif current_time / time_step >= max_steps:
+                stop_message = f"Time limit at t={current_time:.2f}s"
 
         # Data logging for plotting
         time_all.append(current_time)
