@@ -43,17 +43,36 @@ STANDOFF_Z_POINTS = [0.1, 0.5, 1.1, 1.25]
 STANDOFF_POINTS = [0.80, 0.65, 0.65, 0.35]
 # Stop once the EE is this close to the target (m); max iterations set via ROBOENV_MAX_STEPS
 REACH_TOLERANCE = 0.01
+
+#data collection constants
+NOISE_HOLD_STEPS = 150 #redraws noise per 150 steps 
+WHEEL_NOISE_SCALE = 2.0 #tunable
+TORQUE_NOISE_SCALE = np.full(7, 5.0) #per all 7 joints scale by 5newtons
+TORQUE_LIMIT = 30.0
+PIN_THRESHOLD = 0.02
 # ==============================================================================
 
+# train_ranges = {
+#     "distance": [(-3, 3)],
+#     "angle": [(-np.pi, np.pi)],
+#     "height": [(0.15, 1.3)],
+#     "start_xy": [(-1.5, 1.5)],
+#     "arm_offset" : [()]
+#     
+#
 
+# }
 
 def sampling(rng):
     pass
 
 #pass in values for changing: target, xy and arm yaw
-def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
+def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=None, noise_std=0.0,
+                headless=True, floor_friction=1.0, max_steps=40000, joint_margin=0.05, verbose=False):
+    
     target = np.asarray(target, dtype=float)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed if noise_seed is None else noise_seed) #only for noise 
+    start_arm_offset = np.asarray(start_arm_offset, dtype=float)
     
     # --------------------------------------------------------------------------
     # Configuration and Simulation Setup
@@ -63,7 +82,7 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
     sim = pb.SimInterface(conf_file_name, conf_file_path_ext=cur_dir, use_gui=not headless)
 
     # Configure realistic ground contact and skid-steer friction dynamics
-    sim.SetFloorFriction(1.0)
+    sim.SetFloorFriction(floor_friction)
     client = sim.pybullet_client
     rid = sim.bot[0].bot_pybullet
 
@@ -139,9 +158,12 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
     client.resetBasePositionAndOrientation(rid, [start_xy[0], start_xy[1], default_position[2]], start_quat)
 
     #robot arm
+    applied_offset = start_arm_offset.copy()
     for jid, offset in zip(arm_joint_ids, start_arm_offset):
         default_angle = client.getJointState(rid, jid)[0]
         client.resetJointState(rid, jid, targetValue = default_angle+offset, targetVelocity = 0.0)
+
+    
 
     #refresh readings before init is used
     sim.ReceiveObservation()
@@ -157,17 +179,18 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
     pin.updateFramePlacements(dyn_model.pin_model, dyn_model.pin_data)
     init_ee_pos = dyn_model.pin_data.oMf[ee_frame_id].translation.copy()
 
-    print("==================================================================")
-    print(f"Target Cartesian EE Position : {target}")
-    print(f"Initial Cartesian EE Position: {np.round(init_ee_pos, 4)}")
-    print(f"Initial Cartesian Error (m)  : {np.linalg.norm(target - init_ee_pos):.4f}")
-    print("==================================================================")
+    if verbose:
+        print("==================================================================")
+        print(f"Target Cartesian EE Position : {target}")
+        print(f"Initial Cartesian EE Position: {np.round(init_ee_pos, 4)}")
+        print(f"Initial Cartesian Error (m)  : {np.linalg.norm(target - init_ee_pos):.4f}")
+        print("==================================================================")
 
     # Joint limits
     lower_limits, upper_limits = sim.GetBotJointsLimit()
 
     time_step = sim.GetTimeStep()
-    current_time = 0
+    current_time = 0.0
 
     # --------------------------------------------------------------------------
     # Coordinated Motion Planning: Base Navigation & Arm Reach
@@ -193,6 +216,8 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
     qd_des_arm = np.zeros(7)
     arm_lower = np.array(lower_limits[4:11])
     arm_upper = np.array(upper_limits[4:11])
+    revolute = arm_lower < arm_upper
+
     # Stop conditions (step cap, target reached, unreachable-target stall), see StopCriteria
     stop_criteria = StopCriteria(reach_tolerance=REACH_TOLERANCE, max_steps=max_steps)
 
@@ -209,11 +234,13 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
     q_d_all = []
     qd_d_all = []
 
-    #data logging for regressor
+    #data logging for experiments
     data = []
     step = 0
+    n_steps_pinned = 0
     nav_done_time = None
     stop_message = None
+    noise = np.zeros(11)
 
     # --------------------------------------------------------------------------
     # Main Simulation Loop
@@ -240,6 +267,12 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
         ee_error = target - ee_pos
         ee_dist_error = np.linalg.norm(ee_error)
 
+        shoulder_pos = dyn_model.pin_data.oMf[shoulder_frame_id].translation.copy()
+        q_arm = q_mes[4:11]
+        lim_margin = np.where(revolute, np.minimum(q_arm - arm_lower, arm_upper - q_arm), np.nan)
+        if np.any(lim_margin[revolute] < PIN_THRESHOLD):
+            n_steps_pinned += 1
+
         # ----------------------------------------------------------------------
         # 1. Mobile Base Control (Wheel velocities)
         # ----------------------------------------------------------------------
@@ -264,18 +297,33 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
         if base_navigation_done and nav_done_time is None:
             nav_done_time = current_time
 
+        #noise:
 
+        if noise_std > 0 and step % NOISE_HOLD_STEPS == 0:
+            n_r, n_l = (0.0, 0.0) if base_navigation_done else rng.normal(0, noise_std * WHEEL_NOISE_SCALE, 2) #if not moving dont apply noise if so do
+            n_tau = rng.normal(0, 1, 7) * noise_std * TORQUE_NOISE_SCALE #gives 7 random numbers +-1 per arm joint (loc(centre of cluster), scale(standard dev), size(how many nums))
+            noise = np.concatenate(([n_r, n_l, n_l, n_r], n_tau)) 
+        if base_navigation_done:
+            noise[:4] = 0.0 #switch off noise once parked
 
         # ----------------------------------------------------------------------
         # 3. Gripper / Finger Control (Fingers locked at fixed configuration)
         # ----------------------------------------------------------------------
         torque_fingers = np.zeros(6)
-
+       
         # ----------------------------------------------------------------------
         # Send Multi-Interface Control Commands
         # ----------------------------------------------------------------------
         # 4 wheels (velocity) + 7 arm joints (torque) + 6 fingers (torque)
-        cmd_all = np.concatenate((wheel_cmds, torque_arm, torque_fingers))
+        # cmd_all = np.concatenate((wheel_cmds, torque_arm, torque_fingers)) this is now passed in cmd_all below
+
+        #commands with noise sent to expert
+        clean_cmds = np.concatenate((wheel_cmds, torque_arm))
+        sent_cmd = clean_cmds + noise
+        sent_cmd[4:] = np.clip(sent_cmd[4:], -TORQUE_LIMIT, TORQUE_LIMIT) #limits joint values to between -torque limit and +torque limit
+        cmd_all = np.concatenate((sent_cmd, torque_fingers))
+
+       
         control_modes = ["velocity"] * 4 + ["torque"] * 7 + ["torque"] * 6
         cmd.SetControlCmd(cmd_all, control_modes)
         sim.Step(cmd, "torque")
@@ -317,11 +365,11 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
             "base_yaw" : base_bearing,
             "base_qx": base_ori[0], "base_qy": base_ori[1], "base_qz": base_ori[2], "base_qw": base_ori[3],
             "base_vx" : base_lin_vel[0],  "base_vy" : base_lin_vel[1],  "base_vz" : base_lin_vel[2],
-            "base_ax" : base_ang_vel[0],   "base_ay" : base_ang_vel[1],  "base_az" : base_ang_vel[2],
+            "base_wx" : base_ang_vel[0],   "base_wy" : base_ang_vel[1],  "base_wz" : base_ang_vel[2],
 
             #wheels, arm, fingers
-            **{f"wheel angle{i}": q_mes[i] for i in range(4)},
-            **{f"wheel velocity{i}" : qd_mes[i] for i in range(4)},
+            **{f"wheel_angle{i}": q_mes[i] for i in range(4)},
+            **{f"wheel_velocity{i}" : qd_mes[i] for i in range(4)},
             **{f"q{i}": q_mes[4+i] for i in range(7)}, #joint angle
             **{f"qd{i}": qd_mes[4+i] for i in range(7)}, #joint velocity
             **{f"finger{i}": q_mes[11 + i] for i in range(6)},
@@ -329,15 +377,20 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
             #end-effector
             "ee_x": ee_pos[0], "ee_y": ee_pos[1], "ee_z": ee_pos[2],
 
-            #expert data
-            "phase": base_state.phase, "nav_done": base_navigation_done,
+            #expert added data
+            "phase": base_state.phase, "nav_done": base_navigation_done,  #internal memory
             **{f"q_des{i}": q_des_arm[i] for i in range(7)}, #arm desired angle for each joint
             **{f"qd_des{i}": qd_des_arm[i] for i in range(7)}, #arm desired velocity for each joint
-            **{f"tau_g{i}": tau_g[i] for i in range(7)}, #tau_g (extra data)
+            **{f"tau_g{i}": tau_g[i] for i in range(7)}, #tau_g (extra data) gravity torque (predict torque - gravity)
 
-            #controller data it sends
+            #controller data being sent 
             **{f"cmd_wheel{i}": wheel_cmds[i] for i in range(4)},
-            **{f"torque_cmds{i}": torque_arm[i] for i in range(7)},
+            **{f"torque_cmd{i}": torque_arm[i] for i in range(7)},
+
+            **{f"lim_margin{i}": lim_margin[i] for i in range(7)},                                                          #Distance from each joint to its nearest limit
+            "shoulder_x": shoulder_pos[0], "shoulder_y": shoulder_pos[1], "shoulder_z": shoulder_pos[2],                    #Expert reaches relative to shoulder
+            "noise_wheel_r": noise[0], "noise_wheel_l": noise[1],                                                           #records what noise was applied (analysis)
+            **{f"noise_tau{i}": noise[4 + i] for i in range(7)},                                                                          
         })
 
         step+=1
@@ -345,7 +398,7 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
         if not headless:
             time.sleep(0.001)
 
-        current_time += time_step
+        current_time  = step * time_step 
         if int(current_time / time_step) % 500 == 0:
             print(f"t={current_time:.2f}s | Base pos: {np.round(base_pos[:2], 3)} | EE pos: {np.round(ee_pos, 3)} | EE error: {ee_dist_error:.4f}m | yaw {base_bearing:.2f} phase {base_state.phase} nav_done {base_navigation_done}")
 
@@ -359,14 +412,18 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
     #per-episode summary report
     if stop_message is None:
         stop_reason = "quit"
-    elif stop_message.startswith("maximum steps"):
-        stop_reapson = "maximum step count"
-    elif stop_message.startswith("unreachable target"):
-        stop_reason = "uncreachable target"
-    elif stop_message.startswith("target reached"):
-        stop_reason = "target reached"
+    elif "step cap" in stop_message.lower():
+        stop_reason = "step_cap"
+    elif "not reach" in stop_message.lower():
+        stop_reason = "unreachable"
+    elif "reached" in stop_message.lower():
+        stop_reason = "reached"
     else:
         stop_reason = "other"
+
+
+    final_err = float(np.linalg.norm(target - ee_pos))
+    best_ee_error = float(min(np.linalg.norm(df[["ee_x","ee_y","ee_z"]].to_numpy() - target, axis=1).min(), final_err)) if len(df) else final_err
 
 
     summary = {
@@ -378,12 +435,17 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
         "base_goal_x": base_goal_pos[0], "base_goal_y": base_goal_pos[1],
         "standoff": standoff,
         "stop_reason": stop_reason, "stop_message": stop_message,
-        "final_ee_error": float(np.linalg.norm(target - ee_pos)),
-        "best_ee_error": float(stop_criteria.best_ee_error),
+        "final_ee_error": final_err,
+        "best_ee_error": best_ee_error,
         "nav_done_time": nav_done_time,
         "nav_timed_out": nav_done_time is not None and nav_done_time >= BASE_NAV_TIMEOUT,
         "n_steps": step, "sim_duration": current_time,
         "max_finger_dev": float(np.max(np.abs(q_mes[11:17] - target_finger_angles))),
+        **{f"applied_offset{i}": applied_offset[i] for i in range(7)},
+        "floor_friction": floor_friction,
+        "n_rows": len(df),
+        "frac_steps_pinned": n_steps_pinned / max(step, 1),
+        "final_phase": base_state.phase,
     }
 
     # # Final summary report
@@ -456,10 +518,10 @@ def main(target, start_xy, start_yaw, start_arm_offset, seed, noise_std):
 
 
 if __name__ == '__main__':
-    df, summary = main(target=np.array([1.0, -1.0, 0.5]), start_xy=np.array([1.0, 0.0]),
-     start_yaw=np.pi / 2, start_arm_offset=np.zeros(7), seed=0, noise_std=0.0)
+    df, summary = run_episode(target=np.array([-3.0, -3.0, 1.3]), start_xy=np.array([1.0, 0.0]),
+     start_yaw=np.pi / 2, start_arm_offset=np.zeros(7), seed=0, noise_std=0.0, noise_seed=0, verbose=True, headless=True)
     print(df.shape)
     print(df.columns.tolist())
-    print(df[["t", "phase", "nav_done", "cmd_wheel0", "torque_cmds0"]].iloc[::2000])
+    print(df[["t", "phase", "nav_done", "cmd_wheel0", "torque_cmd0"]].iloc[::2000])
     print(summary)
   
