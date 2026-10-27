@@ -47,7 +47,7 @@ REACH_TOLERANCE = 0.01
 #data collection constants
 NOISE_HOLD_STEPS = 150 #redraws noise per 150 steps 
 WHEEL_NOISE_SCALE = 2.0 #tunable
-TORQUE_NOISE_SCALE = np.full(7, 5.0) #per all 7 joints scale by 5newtons
+TORQUE_NOISE_SCALE = np.array([2.91, 2.34, 4.52, 2.80, 3.67, 3.44, 4.01]) #ypical size of that joint’s steering torque while reaching
 TORQUE_LIMIT = 30.0
 PIN_THRESHOLD = 0.02
 # ==============================================================================
@@ -158,12 +158,16 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
     client.resetBasePositionAndOrientation(rid, [start_xy[0], start_xy[1], default_position[2]], start_quat)
 
     #robot arm
-    applied_offset = start_arm_offset.copy()
-    for jid, offset in zip(arm_joint_ids, start_arm_offset):
+    applied_offset = np.zeros(7)
+    for k, (jid, offset) in enumerate(zip(arm_joint_ids, start_arm_offset)):
+        info = client.getJointInfo(rid, jid)
+        lo, hi = info[8], info[9]                        # joint limits from the URDF
         default_angle = client.getJointState(rid, jid)[0]
-        client.resetJointState(rid, jid, targetValue = default_angle+offset, targetVelocity = 0.0)
-
-    
+        start_angle = default_angle + offset
+        if lo < hi:                                      
+            start_angle = float(np.clip(start_angle, lo + joint_margin, hi - joint_margin))  #limits or clips values to max joint limit - the margin for error and vice versa
+        applied_offset[k] = start_angle - default_angle                                       # what the arm actually got
+        client.resetJointState(rid, jid, targetValue=start_angle, targetVelocity=0.0)
 
     #refresh readings before init is used
     sim.ReceiveObservation()
@@ -459,6 +463,9 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
     # print(f"Max Finger Deviation (rad)   : {np.max(np.abs(q_mes[11:17] - target_finger_angles)):.6f}")
     # print("==================================================================")
 
+    assert len(df) == step, (len(df), step)
+    assert 0.0 <= summary["frac_steps_pinned"] <= 1.0
+
     if headless:
         print(f"Headless run finished at t={current_time:.2f}s")
         client.disconnect()
@@ -518,10 +525,10 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
 
 
 if __name__ == '__main__':
-    df, summary = run_episode(target=np.array([-3.0, -3.0, 1.3]), start_xy=np.array([1.0, 0.0]),
-     start_yaw=np.pi / 2, start_arm_offset=np.zeros(7), seed=0, noise_std=0.0, noise_seed=0, verbose=True, headless=True)
-    print(df.shape)
-    print(df.columns.tolist())
-    print(df[["t", "phase", "nav_done", "cmd_wheel0", "torque_cmd0"]].iloc[::2000])
-    print(summary)
+    NOISE = 0.0  
+    df, summary = run_episode(target=np.array([1.0, -1.0, 0.5]), start_xy=np.array([1.0, 0.0]),
+                              start_yaw=np.pi / 2, start_arm_offset=np.zeros(7),
+                              seed=0, noise_seed=0, noise_std=NOISE, headless=False, verbose=True)
+    print(summary["stop_reason"], round(summary["final_ee_error"], 4), round(summary["sim_duration"], 1), "s")
+    print("max noise applied:", df[["noise_wheel_r", "noise_tau0"]].abs().max().round(3).to_dict())
   

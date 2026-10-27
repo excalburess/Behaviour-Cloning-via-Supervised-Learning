@@ -259,7 +259,7 @@ POOLS = {
     "oor_high":  (30,  "oor_high",  0.0),
     "oor_start": (30,  "oor_start", 0.0),
     "oor_arm":   (30,  "oor_arm",   0.0),
-    "dart":      (150, "train",     0.3),
+    "dart":      (150, "train",     0.5),
 }
 
 METHOD, WORKERS, LIMIT = "lhs", 7, None
