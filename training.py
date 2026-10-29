@@ -18,7 +18,8 @@ MODEL_DIR = os.path.join(ROOT, "models")
 OUT_DIR = os.path.join(ROOT, "outputs")
 RESULTS_CSV = os.path.join(OUT_DIR, "results_offline.csv")
 
-ALPHAS = np.logspace(-2, 6, num=17) #ridge logvalues determine alpha which is a constant to reduce training error
+ALPHAS = np.logspace(-2, 6, num=17) #Ridge penalty strengths to try: higher = smaller weights, less overfitting
+TORQUE_LIMIT = 30.0 #FROM original arm_task.py
 
 def load_splits(name):
     return np.loadtxt(os.path.join(SPLIT_DIR, f"{name}_ids.txt"), dtype=int, ndmin=1)
@@ -37,14 +38,18 @@ def load_dataset(pool, dataset, ids=None):
 
 #scales labels so every joint counts as equal in loss and metrics
 def scale_labels(y_train):
-    mean, std = y_train.mean(axis=0). y_train.std(axis=0)
+    mean, std = y_train.mean(axis=0), y_train.std(axis=0)
     std[std < 1e-8] = 1.0
     return mean, std
 
-def dummy_regressor(train, y_mean, y_std):
+def dummy_regressor(train, val, y_mean, y_std):
     #baseline: mean/std of each output on train row (average)
     model = DummyRegressor().fit(train["X"], (train["y"] - y_mean) / y_std)
     return model, {"n_params": int(train["y"].shape[1])}
+
+
+
+
 
 #alternative (more complex ridge fitting using pipeline and gridsearchCV)
 # def fit_ridge(train, y_mean, y_std):
@@ -56,6 +61,10 @@ def dummy_regressor(train, y_mean, y_std):
 #     return search.best_estimator_, {"alpha": float(search.best_params_["ridge__alpha"]),
 #                                     "cv_nmse": float(-search.best_score_),                          #cross validated mean square error
 #                                     "n_params": int(ridge.coef_.size + np.size(ridge.intercept_))}  #weight n_params
+
+
+
+
 
 #try on alpha fit on train and keep best score (fit_ridge)
 def fit_ridge(train, val, y_mean, y_std): #normalise vars
@@ -71,5 +80,98 @@ def fit_ridge(train, val, y_mean, y_std): #normalise vars
     return model, {"alpha": float(alpha), "select_nmse": val_mse,
                    "n_params": int(ridge.coef_.size + ridge.intercept_.size)}
 
-def predict_physical(bundle, X):
-    return bundle["model"].predict(X) * bundle["y_std"] + bundle["y_mean"]
+
+
+
+def predict_physical(bundled_data, X):
+    return bundled_data["model"].predict(X) * bundled_data["y_std"] + bundled_data["y_mean"]
+    #undoes normalisation in one place
+
+def metrics(y_true, y_pred, y_std, label_names, prefix):
+    err = y_true-y_pred
+    out = {f"{prefix}nmse": float(np.mean(err ** 2 / y_std ** 2)),
+           f"{prefix}r2": float(r2_score(y_true, y_pred))} 
+    for i, name in enumerate(label_names):
+        out[f"{prefix}rmse_{name}"] = float(np.sqrt(np.mean(err[:, i] ** 2)))
+    return out
+
+def time_single_row(bundle, x_row, n=300):
+    x_row = x_row.reshape(1, -1)
+    times = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        predict_physical(bundle, x_row)
+        times.append(time.perf_counter() - t0)
+    return float(np.median(times) * 1e6)
+
+def append_results(row):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    old = pd.read_csv(RESULTS_CSV) if os.path.exists(RESULTS_CSV) else pd.DataFrame()
+    table = pd.concat([old, pd.DataFrame([row])], ignore_index=True)
+    table.drop_duplicates(["model", "dataset"], keep="last").to_csv(RESULTS_CSV, index=False)
+
+
+def describe_arm_data(): #describes how much arm data is hovering, and torque saturatoin    
+    d = load_dataset("main", "arm", load_splits("train"))
+    f = d["feature_names"]
+    cols = []
+    for axis in ["x", "y", "z"]:
+        name = f"tgt_minus_ee_{axis}"
+        position = f.index(name)
+        cols.append(position)
+    ee = d["X"][:, cols]
+    print(f"arm train rows: {len(d['X'])} | hovering within 1 cm: {np.mean(np.linalg.norm(ee, axis=1) < 0.01):.1%}"
+          f" | torque labels at the ±{TORQUE_LIMIT:.0f} N·m limit: {np.mean(np.abs(d['y']) > TORQUE_LIMIT - 0.1):.1%}")
+
+
+
+def run(dataset, model_name, train_func):   #calls dummy regressor or ridge
+    train = load_dataset("main", dataset, load_splits("train"))
+    val = load_dataset("main", dataset, load_splits("val"))
+    y_mean, y_std = scale_labels(train["y"])
+    t0 = time.perf_counter()
+    model, info = train_func(train, val, y_mean, y_std)               #info = small diagnostic
+    fit_s = time.perf_counter() - t0                                #fit duration
+
+    trained_model = {"model_name": model_name, "model": model, "y_mean": y_mean, "y_std": y_std, "dataset": dataset,
+              "residual": dataset.endswith("residual"), "torque_limit": TORQUE_LIMIT,
+              "feature_names": train["feature_names"], "label_names": train["label_names"]}
+    
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    joblib.dump(trained_model, os.path.join(MODEL_DIR, f"{model_name}_{dataset}.joblib"))
+
+    pred = predict_physical(trained_model, val["X"])                   #validation inputs and converts predictions to Nm
+
+    #where do values come from summary
+    row = {"model": model_name, "dataset": dataset, **info, "fit_s": round(fit_s, 2),             #**info unpacks info dict(alpha, n_params)
+           "infer_us": time_single_row(trained_model, val["X"][0]), "train_rows": len(train["X"]), "val_rows": len(val["X"]),   #infer us = time to predict row (microseconds)
+           **metrics(val["y"], pred, y_std, train["label_names"], "val_")}
+
+    #loads raw torque labels for the same val episodes so both arms get scored on torque sent
+    if dataset.startswith("arm"):
+        raw_train = load_dataset("main", "arm", load_splits("train"))
+        raw_val = load_dataset("main", "arm", load_splits("val"))
+        assert np.array_equal(raw_val["episode_id"], val["episode_id"]), "arm / arm_residual rows differ"
+        tau_g = raw_val["y"] - val["y"] if trained_model["residual"] else 0.0     # residual label = torque - tau_g
+        full = np.clip(pred + tau_g, -TORQUE_LIMIT, TORQUE_LIMIT)
+        #compare predicted with full torque
+        row.update(metrics(raw_val["y"], full, scale_labels(raw_train["y"])[1], raw_train["label_names"], "val_full_"))
+
+    #averages error in base phase
+    if dataset == "base":
+        e = ((pred - val["y"]) / y_std) ** 2
+        for phase in np.unique(val["phase"]):
+            row[f"val_nmse_{phase}"] = float(e[val["phase"] == phase].mean())
+
+    append_results(row)
+    print(f"{model_name:>6} {dataset:<13} val nmse {row['val_nmse']:.3f}  r2 {row['val_r2']:.3f}"
+          + (f"  full-torque nmse {row['val_full_nmse']:.3f}" if "val_full_nmse" in row else "")
+          + (f"  alpha {row['alpha']:.0e}" if "alpha" in row else "") + f"  {row['infer_us']:.0f} µs/row")
+
+
+if __name__ == "__main__":
+    describe_arm_data()                                        #prints share of arm rows where hand within 1cm and, sahre of torque label sitting at saturated limit
+    for dataset in ("arm", "arm_residual", "base"):
+        for model_name, train_func in (("dummy", dummy_regressor), ("ridge", fit_ridge)):
+            run(dataset, model_name, train_func)
+    print(f"\nfull table: {RESULTS_CSV}  |  models: {MODEL_DIR}")
