@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import qmc
 import multiprocessing as mp
+from tqdm import tqdm
 
 
 #DIRECTORIES
@@ -17,6 +18,8 @@ OUT_DIR = os.path.join(ROOT, "outputs")
 TRAIN = dict(dist=(0.8, 2.5), angle=(-np.pi, np.pi), height=(0.15, 1.10),
              start_xy=(-1.5, 1.5), start_yaw=(-np.pi, np.pi),
              arm_offset=0.25, arm_offset_prob=0.7)
+
+LIMITED_JOINTS = (1, 3, 5)
 
 #Out Of Range Sets
 OOR = {
@@ -117,7 +120,7 @@ def run_one_row(row): #unpacks row to fill in each of run_episodes arguments, ad
         os.replace(path + ".tmp", path)
     except Exception as e:
         summary = {"stop_reason": "crash", "error": f"{type(e).__name__}: {e}",
-                "traceback": traceback.format_exc()[-1500:]}
+                "traceback": traceback.format_exc()[-1500:].replace("\n", " | ")}
         
     summary.update(episode_id=eid, pool=row["pool"], d=row["d"], angle=row["angle"],
         height=row["height"], wall_time_s=time.perf_counter() - t0)
@@ -140,15 +143,15 @@ def collect_data(name, workers=1, limit=None):
     pool = mp.get_context("spawn").Pool(workers, maxtasksperchild=1) if workers > 1 else None       #starts a new process
     results = pool.imap_unordered(run_one_row, rows) if pool else map(run_one_row, rows)            #hands episodes to workers and gives summary as soon as any worker finishes
     t0 = time.perf_counter()                                                                        #time for speed and eta                                         
-    try:    
-        for k, s in enumerate(results, 1):                                                             
-            table.append(s)                                                                         #adds to result list
-            pd.DataFrame(table).to_csv(summary_csv + ".tmp", index=False)                           #writes table to temp file in case of crash
+    try:
+        bar = tqdm(results, total=len(rows), desc=name, unit="ep")                                  #progress bar using tdqm
+        for s in bar:
+            table.append(s)
+            pd.DataFrame(table).to_csv(summary_csv + ".tmp", index=False)
             os.replace(summary_csv + ".tmp", summary_csv)
-            rate = k / (time.perf_counter() - t0) * 60                                                  #episode/min
-            print(f"[{name}] {k}/{len(rows)}  ep {s['episode_id']}  {s['stop_reason']:<11} "
-                  f"err={s.get('final_ee_error', float('nan')):.4f}  {s['wall_time_s']:.0f}s  "
-                  f"| {rate:.1f} eps/min, ETA {(len(rows) - k) / rate:.0f} min", flush=True)
+            bar.set_postfix(ep=s["episode_id"], last=s["stop_reason"])
+            if s["stop_reason"] == "crash":
+                tqdm.write(f"[{name}] episode {s['episode_id']} crashed: {s.get('error')}")
     finally:
         if pool:
             pool.terminate()
@@ -202,6 +205,7 @@ def make_features(df, model, residual=False):
         for i in range(7):                  
             X[f"q{i}"] = df[f"q{i}"].to_numpy() 
             X[f"qd{i}"] = df[f"qd{i}"].to_numpy()   
+        for i in LIMITED_JOINTS:
             X[f"lim_margin{i}"] = df[f"lim_margin{i}"].to_numpy()  #dinstace to limit              
         for part in ("shoulder", "ee"):                                                     #shoulder to target
             px, py = tx - df[f"{part}_x"].to_numpy(), ty - df[f"{part}_y"].to_numpy()           #how far target is from shoulder
@@ -239,7 +243,7 @@ def build_dataset(name, model="arm", stride=10, residual=False):
         ids.append(np.full(len(df), eid))
         phases.append(df["phase"].astype(str).to_numpy())
  
-    X = pd.concat(Xs, ignore_index=True).dropna(axis=1, how="all")      
+    X = pd.concat(Xs, ignore_index=True)   
     y = pd.concat(ys, ignore_index=True)
     assert not X.isna().any().any() and not y.isna().any().any(), "NaNs in dataset"
     out = os.path.join(folder, f"dataset_{model}{'_residual' if residual else ''}.npz")
@@ -250,7 +254,7 @@ def build_dataset(name, model="arm", stride=10, residual=False):
 
 #running the program------------------------------
 
-STEP = "qa"
+STEP = "dataset"
 
 POOLS = {
     #"test":     (20,  "train",     0.0),
@@ -262,7 +266,7 @@ POOLS = {
     "dart":      (150, "train",     0.5),
 }
 
-METHOD, WORKERS, LIMIT = "lhs", 7, None
+METHOD, WORKERS, LIMIT = "lhs", 8, None
 MODEL, STRIDE, RESIDUAL = "arm", 10, False 
 
 if __name__ == "__main__":       # still REQUIRED: worker processes re-import this file

@@ -403,8 +403,8 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
             time.sleep(0.001)
 
         current_time  = step * time_step 
-        if int(current_time / time_step) % 500 == 0:
-            print(f"t={current_time:.2f}s | Base pos: {np.round(base_pos[:2], 3)} | EE pos: {np.round(ee_pos, 3)} | EE error: {ee_dist_error:.4f}m | yaw {base_bearing:.2f} phase {base_state.phase} nav_done {base_navigation_done}")
+        # if int(current_time / time_step) % 500 == 0:
+        #     print(f"t={current_time:.2f}s | Base pos: {np.round(base_pos[:2], 3)} | EE pos: {np.round(ee_pos, 3)} | EE error: {ee_dist_error:.4f}m | yaw {base_bearing:.2f} phase {base_state.phase} nav_done {base_navigation_done}")
 
 
 
@@ -467,7 +467,7 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
     assert 0.0 <= summary["frac_steps_pinned"] <= 1.0
 
     if headless:
-        print(f"Headless run finished at t={current_time:.2f}s")
+        # print(f"Headless run finished at t={current_time:.2f}s")
         client.disconnect()
         return df, summary
 
