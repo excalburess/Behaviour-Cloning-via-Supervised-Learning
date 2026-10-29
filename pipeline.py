@@ -267,7 +267,7 @@ POOLS = {
 }
 
 METHOD, WORKERS, LIMIT = "lhs", 8, None
-MODEL, STRIDE, RESIDUAL = "arm", 10, False 
+MODEL, STRIDE, RESIDUAL = "base", 10, False
 
 if __name__ == "__main__":       # still REQUIRED: worker processes re-import this file
     for name, (n, ranges, noise) in POOLS.items():
