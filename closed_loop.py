@@ -10,7 +10,7 @@ from training import predict_physical, load_splits, MODEL_DIR, OUT_DIR, DATA_DIR
 
 
 #Settings per model
-NAME = "ridge_arm"
+NAME = "ridge_arm_every_1"
 ARM_MODEL = os.path.join(MODEL_DIR, "ridge_arm.joblib")
 BASE_MODEL = None
 SPLIT = "val"
@@ -18,7 +18,7 @@ N_EPISODES = None
 WORKERS = 3
 GUI = True
 SAVE_STEPS = True
-POLICY_EVERY = 10 #rename
+POLICY_EVERY = 1 #rename
 
 
 
