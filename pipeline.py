@@ -1,4 +1,4 @@
-import os, time, glob, argparse, traceback
+import os, time, glob, traceback
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -186,8 +186,8 @@ def qa(name):
     plot_coverage(summ, os.path.join(OUT_DIR, f"outcomes_{name}.png"), f"{name}: outcomes", colour_by="stop_reason") #where target were coloured by result
     print("\n".join("RED FLAG: " + f for f in flags) if flags else f"QA PASSED (expert success {success:.0%})")
 
-def make_features(df, model, residual=False):
-    #transforms record into model input (x) and label (y)
+def make_inputs(df, model):
+    #transforms record into model input (x)
     yaw = df["base_yaw"].to_numpy()
     c, s = np.cos(yaw), np.sin(yaw)
     tx, ty, tz = df["target_x"].to_numpy(), df["target_y"].to_numpy(), df["target_z"].to_numpy()
@@ -200,7 +200,7 @@ def make_features(df, model, residual=False):
         X["tgt_bearing"] = np.arctan2(X["tgt_rel_y"], X["tgt_rel_x"])
         X["v_forward"], X["v_left"] = c * vx + s * vy, -s * vx + c * vy
         X["yaw_rate"] = df["base_wz"].to_numpy()
-        y = {"cmd_right": df["cmd_wheel0"], "cmd_left": df["cmd_wheel1"]}      #wheel speeds expert chose    
+      
     else:
         for i in range(7):                  
             X[f"q{i}"] = df[f"q{i}"].to_numpy() 
@@ -212,11 +212,23 @@ def make_features(df, model, residual=False):
             X[f"tgt_minus_{part}_x"] = c * px + s * py                                                 #turn arrow into robot direction
             X[f"tgt_minus_{part}_y"] = -s * px + c * py
             X[f"tgt_minus_{part}_z"] = tz - df[f"{part}_z"].to_numpy()
-        if residual:     
-            y = {f"tau{i}_minus_g": df[f"torque_cmd{i}"] - df[f"tau_g{i}"] for i in range(7)}      #torque with gravity removed
-        else:
-            y = {f"torque_cmd{i}": df[f"torque_cmd{i}"] for i in range(7)}              #the expert’s torques, or only the steering part with gravity removed.
-    return pd.DataFrame(X, index=df.index), pd.DataFrame(y, index=df.index)
+    return pd.DataFrame(X, index=df.index)
+    
+
+def make_labels(df, model, residual=False): 
+    #makes training labels
+    if model == "base":
+        y = {"cmd_right": df["cmd_wheel0"], "cmd_left": df["cmd_wheel1"]}                         #wheel speeds expert chose
+    elif residual:     
+        y = {f"tau{i}_minus_g": df[f"torque_cmd{i}"] - df[f"tau_g{i}"] for i in range(7)}      #torque with gravity removed
+    else:
+        y = {f"torque_cmd{i}": df[f"torque_cmd{i}"] for i in range(7)}              #the expert’s torques, or only the steering part with gravity removed.
+    return pd.DataFrame(y, index=df.index)
+
+
+def make_features(df, model, residual=False):
+    return make_inputs(df, model), make_labels(df, model, residual)
+
 
 def build_dataset(name, model="arm", stride=10, residual=False):
     folder = os.path.join(DATA_DIR, name)

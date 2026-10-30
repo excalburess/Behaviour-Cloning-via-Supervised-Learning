@@ -68,7 +68,7 @@ def sampling(rng):
 
 #pass in values for changing: target, xy and arm yaw
 def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=None, noise_std=0.0,
-                headless=True, floor_friction=1.0, max_steps=40000, joint_margin=0.05, verbose=False):
+                headless=True, floor_friction=1.0, max_steps=40000, joint_margin=0.05, verbose=False, policy=None):
     
     target = np.asarray(target, dtype=float)
     rng = np.random.default_rng(seed if noise_seed is None else noise_seed) #only for noise 
@@ -273,7 +273,7 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
 
         shoulder_pos = dyn_model.pin_data.oMf[shoulder_frame_id].translation.copy()
         q_arm = q_mes[4:11]
-        lim_margin = np.where(revolute, np.minimum(q_arm - arm_lower, arm_upper - q_arm), np.nan)
+        lim_margin = np.where(revolute, np.minimum(q_arm - arm_lower, arm_upper - q_arm), np.nan) #if revolute joint upper limits > lower 
         if np.any(lim_margin[revolute] < PIN_THRESHOLD):
             n_steps_pinned += 1
 
@@ -301,6 +301,24 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
         if base_navigation_done and nav_done_time is None:
             nav_done_time = current_time
 
+        policy_wheels, policy_torques = None, None
+        if policy is not None:
+            state = {
+                "base_x": base_pos[0], "base_y": base_pos[1], "base_yaw": base_bearing,       # lines 254, 256
+                "base_vx": base_lin_vel[0], "base_vy": base_lin_vel[1], "base_wz": base_ang_vel[2],  # line 261
+                "target_x": target[0], "target_y": target[1], "target_z": target[2],
+                "ee_x": ee_pos[0], "ee_y": ee_pos[1], "ee_z": ee_pos[2],                       # line 270
+                "shoulder_x": shoulder_pos[0], "shoulder_y": shoulder_pos[1], "shoulder_z": shoulder_pos[2],  # line 274
+                **{f"q{i}": q_mes[4 + i] for i in range(7)},                                  # line 257
+                **{f"qd{i}": qd_mes[4 + i] for i in range(7)},                                # line 258
+                **{f"lim_margin{i}": lim_margin[i] for i in range(7)},                        # line 276
+                **{f"tau_g{i}": tau_g[i] for i in range(7)},
+            }
+            if policy.drives_base and not base_navigation_done:
+                policy_wheels = policy.wheel_cmds(state)
+            if policy.drives_arm and base_navigation_done:
+                policy_torques = policy.arm_torques(state)
+
         #noise:
 
         if noise_std > 0 and step % NOISE_HOLD_STEPS == 0:
@@ -322,8 +340,9 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
         # cmd_all = np.concatenate((wheel_cmds, torque_arm, torque_fingers)) this is now passed in cmd_all below
 
         #commands with noise sent to expert
-        clean_cmds = np.concatenate((wheel_cmds, torque_arm))
-        sent_cmd = clean_cmds + noise
+        sent_wheels = wheel_cmds if policy_wheels is None else policy_wheels
+        sent_torques = torque_arm if policy_torques is None else policy_torques
+        sent_cmd = np.concatenate((sent_wheels, sent_torques)) + noise
         sent_cmd[4:] = np.clip(sent_cmd[4:], -TORQUE_LIMIT, TORQUE_LIMIT) #limits joint values to between -torque limit and +torque limit
         cmd_all = np.concatenate((sent_cmd, torque_fingers))
 
@@ -525,10 +544,17 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
 
 
 if __name__ == '__main__':
-    NOISE = 0.0  
-    df, summary = run_episode(target=np.array([1.0, -1.0, 0.5]), start_xy=np.array([1.0, 0.0]),
-                              start_yaw=np.pi / 2, start_arm_offset=np.zeros(7),
-                              seed=0, noise_seed=0, noise_std=NOISE, headless=False, verbose=True)
-    print(summary["stop_reason"], round(summary["final_ee_error"], 4), round(summary["sim_duration"], 1), "s")
-    print("max noise applied:", df[["noise_wheel_r", "noise_tau0"]].abs().max().round(3).to_dict())
-  
+    from closed_loop import Policy
+    MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "ridge_regression_arm.joblib")
+    episode = dict(target=np.array([1.0, -1.0, 0.5]), start_xy=np.array([1.0, 0.0]),
+                   start_yaw=np.pi / 2, start_arm_offset=np.zeros(7), seed=0, noise_std=0.0,
+                   headless=False, verbose=True)
+
+    for name, policy in (("expert", None), ("ridge arm", Policy(arm_model=MODEL))):
+        df, summary = run_episode(
+            target=np.array([1.0, -1.0, 0.5]), start_xy=np.array([1.0, 0.0]),
+            start_yaw=np.pi / 2, start_arm_offset=np.zeros(7), seed=0, noise_std=0.0,
+            headless=False, verbose=True, policy=policy)
+        print(f"{name}: {summary['stop_reason']}, final error {summary['final_ee_error']:.4f} m, "
+            f"{summary['sim_duration']:.1f} s")
+

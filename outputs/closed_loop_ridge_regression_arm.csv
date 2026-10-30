@@ -1,0 +1,2 @@
+stop_reason,error,episode_id,d,height,wall_time_s
+crash,FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\noahc\\uniworkspace\\COMP0245\\Behaviour-Cloning-via-Supervised-Learning\\models\\ridge_regression_arm.joblib',21,2.054425565157528,0.3760254205785598,0.5381213999935426
