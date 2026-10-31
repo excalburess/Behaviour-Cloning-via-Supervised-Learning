@@ -9,6 +9,8 @@ from sklearn.metrics import r2_score
 from sklearn.model_selection import GridSearchCV, GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+import torch
+from torch import nn
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +88,61 @@ def fit_ridge(train, val, y_mean, y_std): #normalise vars
 def predict_physical(bundled_data, X):
     return bundled_data["model"].predict(X) * bundled_data["y_std"] + bundled_data["y_mean"]
     #undoes normalisation in one place
+
+# Code for the MLP, a wrapper is needed to use pytorch with the main code structure
+class TorchMLP:
+    #wraps a torch network so it looks like an sklearn model: .predict(raw numpy X) -> normalised numpy y
+    def __init__(self, net, x_mean, x_std):
+        self.net, self.x_mean, self.x_std = net.eval(), x_mean, x_std     #eval() switches dropout off
+
+    def predict(self, X):
+        X = torch.as_tensor((X - self.x_mean) / self.x_std, dtype=torch.float32)
+        with torch.no_grad():
+            return self.net(X).numpy().astype(np.float64)
+
+
+MLP_HIDDEN = 256
+MLP_DROPOUT = 0.3
+MLP_EPOCHS = 100
+MLP_PATIENCE = 20       #stop after this many epochs with no val improvement
+MLP_BATCH = 1024
+MLP_LR = 1e-3
+
+def fit_torch_mlp(train, val, y_mean, y_std):
+    torch.manual_seed(0)
+    x_mean, x_std = train["X"].mean(axis=0), train["X"].std(axis=0)     #input scaling learnt on train only
+    x_std[x_std < 1e-8] = 1.0
+    to_t = lambda a: torch.as_tensor(a, dtype=torch.float32)
+    X_tr, X_va = to_t((train["X"] - x_mean) / x_std), to_t((val["X"] - x_mean) / x_std)
+    y_tr, y_va = to_t((train["y"] - y_mean) / y_std), to_t((val["y"] - y_mean) / y_std)
+
+    n_in, n_out = X_tr.shape[1], y_tr.shape[1]                          #arm: 26 -> 7, base: 8 -> 2
+    net = nn.Sequential(nn.Linear(n_in, MLP_HIDDEN), nn.ReLU(), nn.Dropout(MLP_DROPOUT),
+                        nn.Linear(MLP_HIDDEN, MLP_HIDDEN), nn.ReLU(), nn.Dropout(MLP_DROPOUT),
+                        nn.Linear(MLP_HIDDEN, n_out))
+    opt = torch.optim.Adam(net.parameters(), lr=MLP_LR)
+    loss_fn = nn.MSELoss()
+
+    best_mse, best_state, best_epoch = np.inf, None, 0
+    for epoch in range(1, MLP_EPOCHS + 1):
+        net.train()
+        for idx in torch.randperm(len(X_tr)).split(MLP_BATCH):         #shuffled mini-batches
+            opt.zero_grad()
+            loss = loss_fn(net(X_tr[idx]), y_tr[idx])
+            loss.backward()
+            opt.step()
+        net.eval()
+        with torch.no_grad():
+            val_mse = float(loss_fn(net(X_va), y_va))
+        if val_mse < best_mse:                                           #keep the best epoch on the val split
+            best_mse, best_epoch = val_mse, epoch
+            best_state = {k: v.clone() for k, v in net.state_dict().items()}
+        elif epoch - best_epoch >= MLP_PATIENCE:
+            break
+
+    net.load_state_dict(best_state)
+    return TorchMLP(net, x_mean, x_std), {"select_nmse": best_mse, "best_epoch": best_epoch,
+                                          "n_params": int(sum(p.numel() for p in net.parameters()))}
 
 def metrics(y_true, y_pred, y_std, label_names, prefix):
     err = y_true-y_pred
@@ -170,8 +227,10 @@ def run(dataset, model_name, train_func):   #calls dummy regressor or ridge
 
 
 if __name__ == "__main__":
+    import training                                            #so the saved class is training.TorchMLP, not __main__.TorchMLP
     describe_arm_data()                                        #prints share of arm rows where hand within 1cm and, sahre of torque label sitting at saturated limit
     for dataset in ("arm", "arm_residual", "base"):
-        for model_name, train_func in (("dummy", dummy_regressor), ("ridge", fit_ridge)):
+        for model_name, train_func in (("dummy", dummy_regressor), ("ridge", fit_ridge),
+                                       ("torch_mlp", training.fit_torch_mlp)):
             run(dataset, model_name, train_func)
     print(f"\nfull table: {RESULTS_CSV}  |  models: {MODEL_DIR}")

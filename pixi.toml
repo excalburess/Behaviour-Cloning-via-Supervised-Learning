@@ -31,6 +31,21 @@ pyarrow = ">=25.0.0,<26"
 [pypi-dependencies]
 simulation_and_control = { path = "./external/simulation_and_control", editable = true }
 
+# torch for the MLP in training.py. PyPI wheels only exist for these three platforms
+# (no CPython 3.14 wheel for Intel Mac), so it is added per platform.
+[target.linux-64.pypi-dependencies]
+torch = "*"
+
+[target.osx-arm64.pypi-dependencies]
+torch = "*"
+
+[target.win-64.pypi-dependencies]
+torch = "*"
+
+# Windows only: torch's OpenMP runtime clashes with the one numpy uses.
+[target.win-64.activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"
+
 # --- machine-learning environment (ml) ----------------------------------------
 # torch/torchvision cannot live in the default environment: conda-forge
 # pytorch only ships CUDA or MKL-linked builds (conflicting with our OpenBLAS
