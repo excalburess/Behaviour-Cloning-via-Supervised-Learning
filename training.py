@@ -182,8 +182,16 @@ def describe_arm_data(): #describes how much arm data is hovering, and torque sa
 
 
 
-def run(dataset, model_name, train_func):   #calls dummy regressor or ridge
-    train = load_dataset("main", dataset, load_splits("train"))
+def load_train(dataset, extra_pools=()):
+    #train split of main, plus every episode of each extra pool (e.g. dart); val/test stay main only
+    parts = [load_dataset("main", dataset, load_splits("train"))] + [load_dataset(pool, dataset) for pool in extra_pools]
+    train = {k: np.concatenate([p[k] for p in parts]) for k in ("X", "y", "episode_id", "phase")}
+    train["feature_names"], train["label_names"] = parts[0]["feature_names"], parts[0]["label_names"]
+    return train
+
+
+def run(dataset, model_name, train_func, extra_pools=()):   #calls dummy regressor or ridge
+    train = load_train(dataset, extra_pools)
     val = load_dataset("main", dataset, load_splits("val"))
     y_mean, y_std = scale_labels(train["y"])
     t0 = time.perf_counter()
@@ -230,7 +238,7 @@ if __name__ == "__main__":
     import training                                            #so the saved class is training.TorchMLP, not __main__.TorchMLP
     describe_arm_data()                                        #prints share of arm rows where hand within 1cm and, sahre of torque label sitting at saturated limit
     for dataset in ("arm", "arm_residual", "base"):
-        for model_name, train_func in (("dummy", dummy_regressor), ("ridge", fit_ridge),
-                                       ("torch_mlp", training.fit_torch_mlp)):
-            run(dataset, model_name, train_func)
+        for model_name, train_func, extra_pools in (
+                                            ("torch_mlp_dart", training.fit_torch_mlp, ("dart",)),):
+            run(dataset, model_name, train_func, extra_pools)
     print(f"\nfull table: {RESULTS_CSV}  |  models: {MODEL_DIR}")
