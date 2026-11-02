@@ -70,7 +70,7 @@ ml = { features = ["ml"], platforms = ["win-64", "linux-64", "osx-arm64"] }
 # numpy.linalg (delay-load of MKL's OpenMP runtime fails outside an
 # activated shell). See README troubleshooting for details.
 [target.win-64.dependencies]
-libblas = { version = "*", build = "*openblas*" }
+libopenblas = { version = "*", build = "pthreads*" }
 
 [tasks]
 

@@ -85,6 +85,43 @@ def fit_ridge(train, val, y_mean, y_std): #normalise vars
 
 
 
+def mlpRegressor(train, val, y_mean, y_std):
+    y_tr = (train["y"] - y_mean) / y_std
+    y_va = (val["y"] - y_mean) / y_std
+
+    model = make_pipeline(StandardScaler(), MLPRegressor(hidden_layer_sizes=(128, 128), solver="adam", learning_rate_init=1e-3, 
+        alpha=1e-4, batch_size=512, max_iter=200, early_stopping=True,
+         n_iter_no_change=20, random_state=0 )).fit(train["X"], y_tr)
+
+    val_mse = float(np.mean((model.predict(val["X"]) - y_va) ** 2))
+    mlp = model[-1] #regressor in pipeline
+    return model, {"select_nmse": val_mse,
+            "n_params": int(sum(w.size for w in mlp.coefs_ + mlp.intercepts_)),
+            "n_iter": int(mlp.n_iter)
+    }
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def predict_physical(bundled_data, X):
     return bundled_data["model"].predict(X) * bundled_data["y_std"] + bundled_data["y_mean"]
     #undoes normalisation in one place
