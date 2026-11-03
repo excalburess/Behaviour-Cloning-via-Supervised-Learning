@@ -1,11 +1,9 @@
-"""Torch MLP policy on top of Noah's pipeline: evaluation side. Noah's files are not edited.
+# #Pick a STEP at the bottom, then: OMP_NUM_THREADS=1 pixi run python mlp_eval.py
+#   "closed_loop" : drives the robot with the models below (Policy or EPolicy when QD_MODEL is set),
+#    on main's SPLIT or on an oor_* pool, optionally with robustness settings
+#   "analyse"     : failure analysis of closed-loop runs (success by target distance/height, failed episodes, png)
+#   "efficiency"  : parameters / file size / inference time / success table + png for the model sizes
 
-Pick a STEP at the bottom, then: OMP_NUM_THREADS=1 pixi run python mlp_eval.py
-  "closed_loop" : drives the robot with the models below (Noah's Policy, or EPolicy when QD_MODEL is set),
-                  on main's SPLIT or on an oor_* pool, optionally with robustness adversities
-  "analyse"     : failure analysis of closed-loop runs (success by target distance/height, failed episodes, png)
-  "efficiency"  : parameters / file size / inference time / success table + png for the model sizes
-"""
 import os
 import time
 import multiprocessing as mp
@@ -13,42 +11,41 @@ import numpy as np
 import pandas as pd
 import joblib
 from tqdm import tqdm
-import mlp                                         #noqa: F401  lets the torch models load (TorchMLP)
+import mlp                                         
 from pipeline import make_inputs
 from training import predict_physical, load_splits, MODEL_DIR, OUT_DIR, DATA_DIR, TORQUE_LIMIT
-from closed_loop import Policy                     #Noah's policy (expert-style, no memory)
+from closed_loop import Policy                     
 
+#what is "policy": the brain that maps our measurments to motion via the model instead of expert
 
-# ---------------------------------------------------------------- policy that tracks the expert's hidden reference
-MAX_Q_LEAD = 0.15     #ArmParams.max_q_lead in robotnik_arm_control.py
+MAX_Q_LEAD = 0.15     #furtherst expert's target joint angles are allowed to run ahead
 DT = 0.001            #simulation step (1 ms): the arm model must run every step
 
-
+#Epolicy keeps memory of the gap between q_des and q (like expert does). Two models can look identical to model this helps differentiate that
 class EPolicy(Policy):
-    #keeps its own copy of the expert's reference lead e = q_des - q, updated like the expert (robotnik_arm_control.py):
-    #q_des <- clip(q_des + qd_des * dt, q - MAX_Q_LEAD, q + MAX_Q_LEAD); qd_des from a learnt model ("qddes"),
-    #the torque from a model that also sees e ("arm_e")
+    #keeps its own copy of the expert's reference lead e = q_des - q, updated similar to our expert (line 270 of robotnik_arm_task)
     def __init__(self, arm_model, qd_model, base_model=None):
-        super().__init__(arm_model, base_model)
+        super().__init__(arm_model, base_model) #takes on policie's vars
         self.qd_model = joblib.load(qd_model)
         self.e, self.q_prev = None, None
 
     @staticmethod
-    def predict_with(trained_model, state, extra):
-        X = make_inputs(pd.DataFrame([state]), "arm")
-        for k, v in extra.items():                                    #adds e0..e6, which make_inputs can't compute
+    def predict_with(trained_model, state, extra):  #runs model on state
+        X = make_inputs(pd.DataFrame([state]), "arm")       #turns into table
+        for k, v in extra.items():                                    #adds e0..e6, which make_inputs() can't compute because gap isnt in state
             X[k] = v
         X = X[trained_model["feature_names"]].to_numpy(dtype=np.float64)
         return predict_physical(trained_model, X)[0]
 
     def arm_torques(self, state):
-        q = np.array([state[f"q{i}"] for i in range(7)])
+        q = np.array([state[f"q{i}"] for i in range(7)]) #reads joint angles
         if self.e is None:                                            #first reaching step: the reference starts at the held pose
             self.e, self.q_prev = np.zeros(7), q
-        qd_des = self.predict_with(self.qd_model, state, {})
-        #q_des moves by qd_des*dt, q moved by (q - q_prev) since last step, then the anti-windup clip
-        self.e = np.clip(self.e + qd_des * DT - (q - self.q_prev), -MAX_Q_LEAD, MAX_Q_LEAD)
+        qd_des = self.predict_with(self.qd_model, state, {}) #predicts how fast ghost should move this step
+        self.e = np.clip(self.e + qd_des * DT - (q - self.q_prev), -MAX_Q_LEAD, MAX_Q_LEAD) #"memory update"
+        #self.e + (qd_des * DT) = forward by speed x1ms - (q - self.q+prev) -> real arm movd too which closes gap np.clip(gap never bigger than 0.15)
         self.q_prev = q
+        #step angle for next step
         torques = self.predict_with(self.arm, state, {f"e{i}": self.e[i] for i in range(7)})
         self.last_torques = np.clip(torques, -TORQUE_LIMIT, TORQUE_LIMIT)
         self.arm_calls += 1
@@ -76,7 +73,7 @@ class SensorNoise:
         return self.policy.arm_torques(self.noisy(state))
 
 
-# ---------------------------------------------------------------- closed loop
+#closed loop
 def run_one(job):
     row, gui = job
     os.environ["ROBOENV_HEADLESS"] = "0" if gui else "1"
@@ -144,7 +141,7 @@ def closed_loop():
     compare_with_expert(model_runs)
 
 
-# ---------------------------------------------------------------- failure analysis
+#failure analysis
 def load_run(name):
     r = pd.read_csv(os.path.join(OUT_DIR, f"closed_loop_{name}.csv"))
     r["reached"] = r["stop_reason"] == "reached"
@@ -196,7 +193,7 @@ def analyse():
     print(f"\nsaved {out}")
 
 
-# ---------------------------------------------------------------- efficiency
+#efficiency
 def efficiency():
     import matplotlib
     matplotlib.use("Agg")
@@ -240,7 +237,7 @@ def efficiency():
     print("saved outputs/efficiency.png and outputs/efficiency_table.csv")
 
 
-# ---------------------------------------------------------------- settings
+#settings
 STEP = "closed_loop"
 
 #closed_loop (final model: 128x2 EPolicy). Normal policy: QD_MODEL = None + an "arm" model. Expert: all three None
