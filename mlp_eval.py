@@ -15,11 +15,29 @@ import mlp
 from pipeline import make_inputs
 from training import predict_physical, load_splits, MODEL_DIR, OUT_DIR, DATA_DIR, TORQUE_LIMIT
 from closed_loop import Policy                     
+from pipeline import make_inputs, LIMITED_JOINTS
 
 #what is "policy": the brain that maps our measurments to motion via the model instead of expert
 
 MAX_Q_LEAD = 0.15     #furtherst expert's target joint angles are allowed to run ahead
 DT = 0.001            #simulation step (1 ms): the arm model must run every step
+
+
+def arm_features(state):
+    c, s = np.cos(state["base_yaw"]), np.sin(state["base_yaw"])
+    tx, ty, tz = state["target_x"], state["target_y"], state["target_z"]
+    dx, dy = tx - state["base_x"], ty - state["base_y"]
+    X = {"tgt_rel_x": c * dx + s * dy, "tgt_rel_y": -s * dx + c * dy, "tgt_z": tz}   #target, robot frame
+    for i in range(7):
+        X[f"q{i}"], X[f"qd{i}"] = state[f"q{i}"], state[f"qd{i}"]
+    for i in LIMITED_JOINTS:
+        X[f"lim_margin{i}"] = state[f"lim_margin{i}"]
+    for part in ("shoulder", "ee"):                                                   #shoulder / hand -> target
+        px, py = tx - state[f"{part}_x"], ty - state[f"{part}_y"]
+        X[f"tgt_minus_{part}_x"] = c * px + s * py
+        X[f"tgt_minus_{part}_y"] = -s * px + c * py
+        X[f"tgt_minus_{part}_z"] = tz - state[f"{part}_z"]
+    return X
 
 #Epolicy keeps memory of the gap between q_des and q (like expert does). Two models can look identical to model this helps differentiate that
 class EPolicy(Policy):
@@ -31,10 +49,8 @@ class EPolicy(Policy):
 
     @staticmethod
     def predict_with(trained_model, state, extra):  #runs model on state
-        X = make_inputs(pd.DataFrame([state]), "arm")       #turns into table
-        for k, v in extra.items():                                    #adds e0..e6, which make_inputs() can't compute because gap isnt in state
-            X[k] = v
-        X = X[trained_model["feature_names"]].to_numpy(dtype=np.float64)
+        X = {**arm_features(state), **extra}                          #adds e0..e6, which the state doesn't contain
+        X = np.array([[X[k] for k in trained_model["feature_names"]]], dtype=np.float64)   #one row, in training order
         return predict_physical(trained_model, X)[0]
 
     def arm_torques(self, state):
@@ -241,7 +257,7 @@ def efficiency():
 STEP = "closed_loop"
 
 #closed_loop (final model: 128x2 EPolicy). Normal policy: QD_MODEL = None + an "arm" model. Expert: all three None
-NAME = "small_e_h128"
+NAME = "small_e_h128_actuator_1"
 ARM_MODEL = os.path.join(MODEL_DIR, "size_h128_l2_arm_e.joblib")
 QD_MODEL = os.path.join(MODEL_DIR, "size_h128_l2_qddes.joblib")      #set = EPolicy, ARM_MODEL must be an arm_e model
 BASE_MODEL = os.path.join(MODEL_DIR, "size_h128_l2_base.joblib")
@@ -251,9 +267,9 @@ N_EPISODES = None
 WORKERS = 7
 GUI = False
 SAVE_STEPS = False       #True keeps step logs (needed for DAgger and the failure curves)
-ACT_NOISE = 0.0          #robustness: random kicks on the sent commands, DART scale (0.5 = training level)
+ACT_NOISE = 1.0     #robustness: random kicks on the sent commands, DART scale (0.5 = training level)
 FRICTION = 1.0           #robustness: floor friction (lower = slippery)
-SENSOR_NOISE = 0.0       #robustness: std (rad) of noise on the joint angles the policy sees (velocities 5x)
+SENSOR_NOISE = 0.02      #robustness: std (rad) of noise on the joint angles the policy sees (velocities 5x)
 
 #analyse
 ANALYSE_RUNS = ["torch_mlp_both", "torch_mlp_dart_both", "torch_mlp_dart2_both", "torch_mlp_dart2_e_both", "small_e_h128"]
