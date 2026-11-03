@@ -1,35 +1,3 @@
-"""GRU (recurrent) policy on top of Noah's pipeline. Noah's files are not edited.
-
-Why a GRU: the expert has memory the MLP cannot see. The base controller is in one of several phases
-(align / drive / orient) and the arm controller integrates its own joint reference q_des over time (clipped to
-0.15 rad ahead of q). A GRU carries a hidden state through the episode, so it can infer that history from what it
-has seen so far. Same split as Noah's Policy: the base GRU drives until the base is parked (nav_done), the arm GRU
-reaches after that.
-
-    e_t = SiLU(Linear(x_t))          feature embedding
-    h_k = GRU(e_k, h_{k-1})          memory, updated every 10 calls (10 ms, the STRIDE the sequences are built with)
-    y_t = MLP([h_k, e_t])            head: memory + current features -> command, every call (1 ms)
-
-Pick a STEP at the bottom, then: pixi run python gru.py
-  "pools"       : plans and collects the pools pipeline.py does not define (dart2, sel), see EXTRA_POOLS
-  "train"       : trains the base and arm GRUs on main's train split + EXTRA pools, saves models/<NAME>.joblib
-                  (with the train/val loss of every epoch, for Fig. 2)
-  "ensemble"    : one model file whose arm is the mean of several trained arm GRUs (MEMBERS)
-  "closed_loop" : drives the robot with models/<NAME>.joblib on main's SPLIT or another POOL (oor_*, sel), optionally
-                  with sensor noise / actuator noise / low friction; prints success and final error mean +- std
-  "dagger"      : the GRU drives on main's train episodes while the expert labels in shadow (DART noise optional);
-                  the logs are saved as a new pool data/<POOL>/ that "train" can use as an EXTRA pool
-  "report"      : parameters, file size, inference time, offline test NMSE, closed-loop numbers -> gru_report.csv,
-                  and the loss curves of the last REPORT model -> gru_loss_curves_<NAME>.png
-Inference is plain numpy (no torch in the simulator processes).
-
-Final model (models/gru_e80.joblib), after pipeline.py has collected main + dart and "pools" has collected dart2:
-  1. NAME = "gru_dart2", EXTRA = ["dart", "dart2"], EPOCHS = 40, BASE_FROM = None       -> "train"
-  2. NAME = "gru_e80",   EXTRA = ["dart", "dart2"], EPOCHS = 80, BASE_FROM = "gru_dart2" -> "train" (arm only)
-Chosen on val + sel (200 episodes) among seeds / epochs / near-target weighting / a 3-seed ensemble; test used once.
-DAgger did not help: the expert's labels depend on its own q_des integrator, which winds up to its 0.15 rad clip
-while the GRU drives, so the logged torques are one long saturated push (gru_dagger1: 71.5% on sel vs 92.7%).
-"""
 import os
 import glob
 import time
@@ -41,7 +9,7 @@ from tqdm import tqdm
 from robotnik_arm_task import STANDOFF_Z_POINTS, STANDOFF_POINTS, ARM_REACH_LIMIT, TORQUE_LIMIT
 from training import load_splits, MODEL_DIR, OUT_DIR, DATA_DIR
 
-STRIDE = 10             #memory update period in calls = row stride of the training sequences
+STRIDE = 10             #memory update period in calls 
 MAX_WHEEL = 3.5         #the expert never goes above 3 rad/s
 
 BASE_FEATURES = ["tgt_rel_x", "tgt_rel_y", "tgt_z", "goal_rel_x", "goal_rel_y", "goal_dist",
@@ -50,17 +18,15 @@ ARM_FEATURES = (["tgt_rel_x", "tgt_rel_y", "tgt_z"] + [f"q_sin{i}" for i in rang
                 + [f"q{i}" for i in range(7)] + [f"qd{i}" for i in range(7)]
                 + ["ee_err_x", "ee_err_y", "ee_err_z", "ee_err_norm", "reach_err_x", "reach_err_y", "reach_err_z",
                    "reach_err_norm"])
-BASE_LABELS = ["cmd_wheel0", "cmd_wheel1"]                        #right, left (the expert sends [r, l, l, r])
-ARM_LABELS = [f"tau{i}_minus_g" for i in range(7)]                #torque minus gravity, tau_g added back at run time
+BASE_LABELS = ["cmd_wheel0", "cmd_wheel1"]                      
+ARM_LABELS = [f"tau{i}_minus_g" for i in range(7)]              
 
-
-# ---------------------------------------------------------------- features (same code for logged data and live state)
+# features (same code for logged data and live state)
 def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
-def gru_inputs(d):
-    #d: DataFrame of logged rows, or a dict of one live state (state dict of run_episode). Robot-frame geometry.
+def gru_inputs(d):         
     g = lambda k: np.atleast_1d(np.asarray(d[k], dtype=np.float64))
     yaw, bx, by = g("base_yaw"), g("base_x"), g("base_y")
     tx, ty, tz = g("target_x"), g("target_y"), g("target_z")
@@ -69,6 +35,8 @@ def gru_inputs(d):
     X = {}
     X["tgt_rel_x"], X["tgt_rel_y"] = rot(tx - bx, ty - by)
     X["tgt_z"] = tz
+
+
     #parking pose, same rule as robotnik_arm_task.py
     standoff = np.interp(tz, STANDOFF_Z_POINTS, STANDOFF_POINTS)
     goal_yaw = np.where(np.hypot(tx, ty) > 1e-4, np.arctan2(ty, tx), 0.0)
@@ -83,6 +51,7 @@ def gru_inputs(d):
     for i in range(7):
         X[f"q_sin{i}"], X[f"q_cos{i}"] = np.sin(q[:, i]), np.cos(q[:, i])
         X[f"q{i}"], X[f"qd{i}"] = q[:, i], g(f"qd{i}")
+
     #hand -> target, and the reach-limited version the expert's IK chases (far targets projected onto the sphere)
     ee = np.stack([g("ee_x"), g("ee_y"), g("ee_z")], axis=1)
     sh = np.stack([g("shoulder_x"), g("shoulder_y"), g("shoulder_z")], axis=1)
@@ -90,6 +59,8 @@ def gru_inputs(d):
     off = tgt - sh
     n = np.linalg.norm(off, axis=1, keepdims=True)
     off = np.where(n > ARM_REACH_LIMIT, off * ARM_REACH_LIMIT / np.maximum(n, 1e-9), off)
+
+
     for name, err in (("ee_err", tgt - ee), ("reach_err", sh + off - ee)):
         X[f"{name}_x"], X[f"{name}_y"] = rot(err[:, 0], err[:, 1])
         X[f"{name}_z"] = err[:, 2]
@@ -133,7 +104,7 @@ def load_sequences(pool, ids=None):
     return base, arm
 
 
-# ---------------------------------------------------------------- training (torch)
+#training (torch)
 def build_net(n_in, n_out, hidden):
     import torch
     from torch import nn
@@ -221,7 +192,8 @@ def train(name, extra_pools, hidden=128, epochs=40, batch=8, lr=1e-3, near_weigh
     tr_ids, va_ids = set(load_splits("train")), set(load_splits("val"))
     base_tr, arm_tr = load_sequences("main", tr_ids)
     base_va, arm_va = load_sequences("main", va_ids)
-    for pool in extra_pools:                                       #DART / DAgger pools: training only
+
+    for pool in extra_pools:                   #DART / DAgger pools: training only
         b, a = load_sequences(pool)
         base_tr, arm_tr = base_tr + b, arm_tr + a
     base = (joblib.load(os.path.join(MODEL_DIR, f"{base_from}.joblib"))["base"] if base_from else
@@ -244,7 +216,6 @@ def ensemble(name, members):
     print(f"saved {path}")
 
 
-# ---------------------------------------------------------------- policy (numpy)
 def _silu(h):
     return h * 0.5 * (1.0 + np.tanh(0.5 * h))                      #overflow-free h * sigmoid(h)
 
@@ -277,7 +248,7 @@ class _GRUNumpy:
         return (self.head[-1][0] @ h + self.head[-1][1]) * self.m["y_std"] + self.m["y_mean"]
 
 
-class _Ensemble:
+class _Ensemble: #internal class helper
     #several arm GRUs (different training seeds), each with its own memory; the command is their mean
     def __init__(self, members):
         self.nets = [_GRUNumpy(a) for a in members]
@@ -287,7 +258,7 @@ class _Ensemble:
 
 
 class GRUPolicy:
-    #same interface as Noah's Policy (closed_loop.py). One instance per episode: the memory starts empty.
+    #same interface as MLP policy
     def __init__(self, model_path, drives_base=True, drives_arm=True):
         m = joblib.load(model_path)
         self.stride = m["stride"]
@@ -333,7 +304,7 @@ class SensorNoise:
         return self.policy.arm_torques(self.noisy(state))
 
 
-# ---------------------------------------------------------------- closed loop / DAgger
+#run one job
 def run_one(job):
     row, model_path, drives_base, drives_arm, noise_std, save_folder, gui, sensor_noise, friction = job
     os.environ["ROBOENV_HEADLESS"] = "0" if gui else "1"
@@ -359,7 +330,7 @@ def run_one(job):
     return summary
 
 
-def run_many(jobs, workers, gui):
+def run_many(jobs, workers, gui): #runs multiple workers at the same time
     if gui or workers == 1:
         return [run_one(j) for j in tqdm(jobs)]
     with mp.get_context("spawn").Pool(workers, maxtasksperchild=1) as pool:
@@ -368,24 +339,28 @@ def run_many(jobs, workers, gui):
 
 def closed_loop(name, split, workers, gui=False, drives_base=True, drives_arm=True, n_episodes=None, pool="main",
                 sensor_noise=0.0, act_noise=0.0, friction=1.0, tag=""):
-    #pool "main" = the SPLIT episodes of main; any other pool (oor_*, sel) = all its episodes.
-    #sensor_noise / act_noise / friction: robustness conditions, same meaning as in Finn's mlp_eval.py
     plan = pd.read_csv(os.path.join(DATA_DIR, pool, "plan.csv"))
+
     if pool == "main":
         plan = plan[plan["episode_id"].isin(load_splits(split))]
+
     plan = plan.head(1) if gui else (plan.head(n_episodes) if n_episodes else plan)
     model_path = os.path.join(MODEL_DIR, f"{name}.joblib")
+
     run_name = (f"{name}_{split if pool == 'main' else pool}" + ("" if drives_base else "_arm")
                 + ("" if drives_arm else "_base") + tag)
+    
     print(f"{run_name}: {len(plan)} {split if pool == 'main' else pool} episodes | base: "
           f"{'GRU' if drives_base else 'expert'} | arm: {'GRU' if drives_arm else 'expert'} | sensor noise "
           f"{sensor_noise}, act noise {act_noise}, friction {friction}")
+    
     jobs = [(row, model_path, drives_base, drives_arm, act_noise, None, gui, sensor_noise, friction)
             for row in plan.to_dict("records")]
     runs = pd.DataFrame(run_many(jobs, workers, gui))
+
     os.makedirs(OUT_DIR, exist_ok=True)
     runs.to_csv(os.path.join(OUT_DIR, f"closed_loop_{run_name}.csv"), index=False)
-    #the expert's own run of the same episodes (clean conditions)
+    #the expert's own run of the same episodes 
     expert = pd.read_csv(os.path.join(DATA_DIR, pool, "summary.csv")).drop_duplicates("episode_id", keep="last")
     expert = expert[expert["episode_id"].isin(runs["episode_id"])]
     table = []
@@ -402,8 +377,7 @@ def closed_loop(name, split, workers, gui=False, drives_base=True, drives_arm=Tr
     return runs
 
 
-def dagger(name, pool, workers, noise_std=0.0):
-    #the GRU drives on main's train episodes; the step logs hold the expert's commands for every state it visited
+def dagger(name, pool, workers, noise_std=0.0): #generates dagger pool
     folder = os.path.join(DATA_DIR, pool)
     os.makedirs(folder, exist_ok=True)
     plan = pd.read_csv(os.path.join(DATA_DIR, "main", "plan.csv"))
@@ -417,15 +391,13 @@ def dagger(name, pool, workers, noise_std=0.0):
     pd.concat([old, pd.DataFrame(run_many(jobs, workers, False))]).to_csv(summary_csv, index=False)
 
 
-# ---------------------------------------------------------------- extra pools
-#pools that are not in pipeline.py's POOLS: (name, first episode id, episodes, ranges, noise_std). IDs continue
-#Noah's numbering (test 0-19, main 20-439, oor_* 440-559, dart 560-709), seed = first id as in pipeline.py
-EXTRA_POOLS = [("dart2", 710, 500, "train", 0.5),     #second DART pool (as Finn's plan_dart2.png; noise inferred)
-               ("sel", 1210, 137, "train", 0.0)]      #extra selection episodes: with val, 200 for choosing models
+
+EXTRA_POOLS = [("dart2", 710, 500, "train", 0.5),     #second DART pool 
+               ("sel", 1210, 137, "train", 0.0)]      #extra selection episodes
 
 
 def make_pools(workers):
-    #plans (with Noah's make_plan) and collects the EXTRA_POOLS; resumable like pipeline.py's collect
+    #plans to collect extra data pools when necessary
     import pipeline
     for name, first, n, ranges, noise in EXTRA_POOLS:
         path = os.path.join(DATA_DIR, name, "plan.csv")
@@ -435,7 +407,7 @@ def make_pools(workers):
         pipeline.collect_data(name, workers)
 
 
-# ---------------------------------------------------------------- report (Table III numbers, Fig. 2 curves)
+# VALIDATOIN METRICS
 def offline_mse(net_models, seqs):
     #standardised MSE on held-out sequences (= NMSE: labels are scaled by the train std), memory reset per episode.
     #net_models: one network, or the members of an ensemble (prediction = their mean)
@@ -449,7 +421,7 @@ def offline_mse(net_models, seqs):
 
 
 def inference_us(model_path, n=2000):
-    #time per control call on logged test states, features included (the robot calls the policy every 1000 us)
+    #Inference time+ feature time
     eid = int(load_splits("test")[0])
     df = pd.read_parquet(os.path.join(DATA_DIR, "main", f"ep{eid:05d}.parquet"))
     out = {}
@@ -529,7 +501,7 @@ def plot_curves(name):
     print(f"saved {out}")
 
 
-# ---------------------------------------------------------------- settings
+# Settings #
 STEP = "closed_loop"
 NAME = "gru_e80"                    #models/<NAME>.joblib (final model)
 EXTRA = ["dart", "dart2"]           #extra training pools, e.g. ["dart", "dart2", "gru_dagger1"]
