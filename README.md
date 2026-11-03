@@ -18,9 +18,10 @@ A model learns to imitate the expert controller of a Robotnik mobile base with a
 7. [Step 7: train the models](#step-7-train-the-models)
 8. [Step 8: closed-loop test](#step-8-closed-loop-test)
 9. [Step 9: diagnose a run](#step-9-diagnose-a-run-optional)
-10. [Output files](#output-files)
-11. [External, modified, written from scratch](#external-modified-written-from-scratch)
-12. [Original task notes](#original-task-notes)
+10. [GRU policy (`gru.py`)](#gru-policy-grupy)
+11. [Output files](#output-files)
+12. [External, modified, written from scratch](#external-modified-written-from-scratch)
+13. [Original task notes](#original-task-notes)
 
 ---
 
@@ -310,6 +311,48 @@ Rows: `expert` (from the collected data) and your model, on exactly the same epi
 **What it does:** for one closed-loop episode, it plots the hand-to-target distance and, for each joint, the torque the model sent against the torque the expert would have sent.
 
 **You get:** `outputs/diagnose_*.png`. Use a new file name per run, or the plots overwrite each other.
+
+---
+
+## GRU policy (`gru.py`)
+
+**Final model: `models/gru_e80.joblib`**
+
+A recurrent policy, built on the steps above in the same way as the MLP files (no pipeline file is edited). The base GRU drives until the base is parked, then the arm GRU reaches. Its memory lets it follow the expert's hidden state: the driving phase, and the arm's joint reference `q_des`, which the expert builds up over time.
+
+**Run:** set `STEP` at the bottom of `gru.py`, then `pixi run python gru.py`
+
+| `STEP` | What it does | Main output |
+|---|---|---|
+| `"pools"` | Plans and collects the pools `pipeline.py` does not define: `dart2` (500 episodes, noise 0.5) and `sel` (137 extra episodes for choosing models) | `data/dart2/`, `data/sel/` |
+| `"train"` | Trains the base and arm GRUs on `main` train + `EXTRA` pools, keeping the epoch with the best val loss | `models/<NAME>.joblib` |
+| `"closed_loop"` | Lets the GRU drive on `SPLIT` of `main`, or on another `POOL` (`sel`, `oor_*`), optionally with sensor noise, actuator noise or low friction | `outputs/closed_loop_<NAME>_<split or pool>.csv` |
+| `"report"` | Parameters, inference time, offline test NMSE, closed-loop numbers, loss curves | `outputs/gru_report.csv`, `outputs/gru_loss_curves_<NAME>.png` |
+| `"dagger"`, `"ensemble"` | Experiments that did not improve the final model (see below) | |
+
+**Rebuild the final model** (after `pipeline.py` has collected `main` and `dart`, and `"pools"` has collected `dart2`):
+
+| Run | `NAME` | `EXTRA` | `EPOCHS` | `BASE_FROM` |
+|---|---|---|---|---|
+| 1 | `"gru_dart2"` | `["dart", "dart2"]` | `40` | `None` |
+| 2 | `"gru_e80"` | `["dart", "dart2"]` | `80` | `"gru_dart2"` (arm only is retrained) |
+
+**Results** (full table: `outputs/gru_vs_mlp.csv`, same episodes for both models):
+
+| Condition | GRU `gru_e80` | MLP `small_e_h128` |
+|---|---|---|
+| test (63) | 60/63 (95.2%), 0.92 ± 0.41 cm | 60/63 (95.2%), 1.05 ± 0.83 cm |
+| val + sel (200) | 195/200 | 181/200 |
+| `oor_far` / `oor_high` / `oor_start` / `oor_arm` (30 each) | 30 / 12 / 29 / 28 | 28 / 6 / 28 / 27 |
+| sensor noise 0.005 / 0.02 rad | 62 / 61 of 63 | 60 / 61 of 63 |
+| actuator noise 0.5 / floor friction 0.5 | 47 / 62 of 63 | 45 / 60 of 63 |
+
+**How it was chosen:** on val + `sel` (200 episodes), from training seeds, 40 vs 80 epochs, extra weight on the last 3 cm, and a 3-seed ensemble. Test was used once, for `gru_e80` only.
+
+**Notes:**
+- **DAgger made it worse** (71.5% on `sel`, against 92.7% without it). The expert's torque depends on its own `q_des`, which winds up to its 0.15 rad limit while the GRU drives. The logged labels are then one long saturated push, not what the expert would do from that state.
+- **`dart2` settings are inferred.** The noise level (0.5) and IDs (710–1209) were rebuilt from `outputs/plan_dart2.png`; `sel` uses IDs 1210–1346.
+- **Inference** is plain numpy, about 100 µs per step against the 1 ms control period. The model has 305k parameters (base 150k + arm 155k).
 
 ---
 
