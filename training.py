@@ -18,8 +18,8 @@ MODEL_DIR = os.path.join(ROOT, "models")
 OUT_DIR = os.path.join(ROOT, "outputs")
 RESULTS_CSV = os.path.join(OUT_DIR, "results_offline.csv")
 
-ALPHAS = np.logspace(-2, 6, num=17) #Ridge penalty strengths to try: higher = smaller weights, less overfitting
-TORQUE_LIMIT = 30.0 #FROM original arm_task.py
+ALPHAS = np.logspace(-2, 6, num=17)                                 #Ridge penalty strengths to try: higher = smaller weights, less overfitting
+TORQUE_LIMIT = 30.0 
 
 def load_splits(name):
     return np.loadtxt(os.path.join(SPLIT_DIR, f"{name}_ids.txt"), dtype=int, ndmin=1)
@@ -48,24 +48,6 @@ def dummy_regressor(train, val, y_mean, y_std):
     return model, {"n_params": int(train["y"].shape[1])}
 
 
-
-
-
-#alternative (more complex ridge fitting using pipeline and gridsearchCV)
-# def fit_ridge(train, y_mean, y_std):
-#     #finds best hyperparams(gridsearchcv) and scales inputs so all have same value(make_pipeline(standard_scaler())
-#     pipeline = make_pipeline(StandardScaler(), Ridge()) 
-#     search = GridSearchCV(pipeline, {"ridge__alpha": ALPHAS}, cv=GroupKFold(n_splits=5), scoring="neg_mean_squared_error")          #pipeline=estimator, 
-#     search.fit(train["X"], (train["y"] - y_mean) / y_std, groups=train["episode_id"]) #groups is for kfold to see which episode each row belongs to
-#     ridge = search.best_estimator_[-1]
-#     return search.best_estimator_, {"alpha": float(search.best_params_["ridge__alpha"]),
-#                                     "cv_nmse": float(-search.best_score_),                          #cross validated mean square error
-#                                     "n_params": int(ridge.coef_.size + np.size(ridge.intercept_))}  #weight n_params
-
-
-
-
-
 #try on alpha fit on train and keep best score (fit_ridge)
 def fit_ridge(train, val, y_mean, y_std): #normalise vars
     y_tr = (train["y"] - y_mean) / y_std
@@ -79,8 +61,6 @@ def fit_ridge(train, val, y_mean, y_std): #normalise vars
     ridge = model[-1]
     return model, {"alpha": float(alpha), "select_nmse": val_mse,
                    "n_params": int(ridge.coef_.size + ridge.intercept_.size)}
-
-
 
 
 def mlpRegressor(train, val, y_mean, y_std):
@@ -97,27 +77,6 @@ def mlpRegressor(train, val, y_mean, y_std):
             "n_params": int(sum(w.size for w in mlp.coefs_ + mlp.intercepts_)),
             "n_iter": int(mlp.n_iter)
     }
-
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def predict_physical(bundled_data, X):
@@ -147,8 +106,8 @@ def append_results(row):
     table = pd.concat([old, pd.DataFrame([row])], ignore_index=True)
     table.drop_duplicates(["model", "dataset"], keep="last").to_csv(RESULTS_CSV, index=False)
 
-
-def describe_arm_data(): #describes how much arm data is hovering, and torque saturatoin    
+#describes how much arm data is hovering, and torque saturatoin   
+def describe_arm_data():
     d = load_dataset("main", "arm", load_splits("train"))
     f = d["feature_names"]
     cols = []

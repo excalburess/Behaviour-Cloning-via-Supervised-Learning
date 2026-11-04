@@ -52,19 +52,6 @@ TORQUE_LIMIT = 30.0
 PIN_THRESHOLD = 0.02
 # ==============================================================================
 
-# train_ranges = {
-#     "distance": [(-3, 3)],
-#     "angle": [(-np.pi, np.pi)],
-#     "height": [(0.15, 1.3)],
-#     "start_xy": [(-1.5, 1.5)],
-#     "arm_offset" : [()]
-#     
-#
-
-# }
-
-def sampling(rng):
-    pass
 
 #pass in values for changing: target, xy and arm yaw
 def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=None, noise_std=0.0,
@@ -111,8 +98,6 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
             arm_joint_ids.append(j)
     #check for arm joints correct amount:
     assert len(arm_joint_ids) == 7, arm_joint_ids
-
-    
 
 
     # --------------------------------------------------------------------------
@@ -216,7 +201,7 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
     # Arm controller (differential IK + joint PD), see ArmControllerParams
     arm_params = ArmControllerParams(reach_limit=ARM_REACH_LIMIT)
     q_init_arm = init_joint_angles[4:11].copy()
-    q_des_arm = q_init_arm.copy()
+    q_des_arm = q_init_arm.copy()   #desired q starts on real arm
     qd_des_arm = np.zeros(7)
     arm_lower = np.array(lower_limits[4:11])
     arm_upper = np.array(upper_limits[4:11])
@@ -289,6 +274,9 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
         # 2. Arm Control (reaching via differential IK + gravity-compensated joint PD)
         # ----------------------------------------------------------------------
         # While the base is travelling the arm holds its nominal configuration.
+
+
+        #passing q_des_arm in and feedback being outputted. [Gives "memory"] 
         torque_arm, q_des_arm, qd_des_arm = arm_controller(
             dyn_model, q_pin, q_mes[4:11], qd_mes[4:11], q_des_arm, q_init_arm, target, ee_pos,
             ee_frame_id, shoulder_frame_id, arm_lower, arm_upper, time_step, arm_params,
@@ -301,17 +289,16 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
         if base_navigation_done and nav_done_time is None:
             nav_done_time = current_time
 
+        #policy = model commands and inputs sent to robot rather than expert sending commands
         policy_wheels, policy_torques = None, None
         if policy is not None:
             state = {
-                "base_x": base_pos[0], "base_y": base_pos[1], "base_yaw": base_bearing,       # lines 254, 256
-                "base_vx": base_lin_vel[0], "base_vy": base_lin_vel[1], "base_wz": base_ang_vel[2],  # line 261
+                "base_x": base_pos[0], "base_y": base_pos[1], "base_yaw": base_bearing,       
+                "base_vx": base_lin_vel[0], "base_vy": base_lin_vel[1], "base_wz": base_ang_vel[2],  
                 "target_x": target[0], "target_y": target[1], "target_z": target[2],
-                "ee_x": ee_pos[0], "ee_y": ee_pos[1], "ee_z": ee_pos[2],                       # line 270
-                "shoulder_x": shoulder_pos[0], "shoulder_y": shoulder_pos[1], "shoulder_z": shoulder_pos[2],  # line 274
-                **{f"q{i}": q_mes[4 + i] for i in range(7)},                                  # line 257
-                **{f"qd{i}": qd_mes[4 + i] for i in range(7)},                                # line 258
-                **{f"lim_margin{i}": lim_margin[i] for i in range(7)},                        # line 276
+                "ee_x": ee_pos[0], "ee_y": ee_pos[1], "ee_z": ee_pos[2],                       
+                "shoulder_x": shoulder_pos[0], "shoulder_y": shoulder_pos[1], "shoulder_z": shoulder_pos[2],  
+                **{f"q{i}": q_mes[4 + i] for i in range(7)},                                 
                 **{f"tau_g{i}": tau_g[i] for i in range(7)},
             }
             if policy.drives_base and not base_navigation_done:
@@ -319,8 +306,9 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
             if policy.drives_arm and base_navigation_done:
                 policy_torques = policy.arm_torques(state)
 
-        #noise:
 
+
+        #noise:
         if noise_std > 0 and step % NOISE_HOLD_STEPS == 0:
             n_r, n_l = (0.0, 0.0) if base_navigation_done else rng.normal(0, noise_std * WHEEL_NOISE_SCALE, 2) #if not moving dont apply noise if so do
             n_tau = rng.normal(0, 1, 7) * noise_std * TORQUE_NOISE_SCALE #gives 7 random numbers +-1 per arm joint (loc(centre of cluster), scale(standard dev), size(how many nums))

@@ -267,9 +267,9 @@ N_EPISODES = None
 WORKERS = 7
 GUI = False
 SAVE_STEPS = False       #True keeps step logs (needed for DAgger and the failure curves)
-ACT_NOISE = 1.0     #robustness: random kicks on the sent commands, DART scale (0.5 = training level)
-FRICTION = 1.0           #robustness: floor friction (lower = slippery)
-SENSOR_NOISE = 0.02      #robustness: std (rad) of noise on the joint angles the policy sees (velocities 5x)
+ACT_NOISE = 0     #robustness: random kicks on the sent commands, DART scale (0.5 = training level)
+FRICTION = 0.4        #robustness: floor friction (lower = slippery)
+SENSOR_NOISE = 0     #robustness: std (rad) of noise on the joint angles the policy sees (velocities 5x)
 
 #analyse
 ANALYSE_RUNS = ["torch_mlp_both", "torch_mlp_dart_both", "torch_mlp_dart2_both", "torch_mlp_dart2_e_both", "small_e_h128"]
