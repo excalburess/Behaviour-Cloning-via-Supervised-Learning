@@ -1,13 +1,4 @@
-"""Torch MLP policy on top of Noah's pipeline: training side. Noah's files are not edited.
 
-Pick a STEP at the bottom, then: pixi run python mlp.py
-  "e_datasets"  : builds dataset_arm_e.npz (arm inputs + e = q_des - q -> torques) and dataset_qddes.npz (arm inputs -> qd_des)
-  "dagger_pool" : turns the step logs of a closed-loop run (mlp_eval.py, SAVE_STEPS = True) into a data pool (DAgger)
-  "train"       : trains MLPs on main train + EXTRA pools (e.g. the DART pools), saved as models/<NAME>_<dataset>.joblib
-  "sweep"       : one-at-a-time hyperparameter sweep around the baseline
-  "size"        : width/depth sweep, to find the smallest network that keeps the accuracy
-Offline results go to Noah's outputs/results_offline.csv, in the same format as his models.
-"""
 import os
 import glob
 import time
@@ -22,8 +13,8 @@ from training import (DATA_DIR, OUT_DIR, MODEL_DIR, TORQUE_LIMIT, load_dataset, 
 from pipeline import make_inputs, make_labels, build_dataset
 
 
+#wrapper for a torch network so it plugs into policy 
 class TorchMLP:
-    #wraps a torch network so it looks like an sklearn model: .predict(raw numpy X) -> normalised numpy y
     def __init__(self, net, x_mean, x_std):
         self.net, self.x_mean, self.x_std = net.eval(), x_mean, x_std     #eval() switches dropout off
 
@@ -33,24 +24,23 @@ class TorchMLP:
             return self.net(X).numpy().astype(np.float64)
 
 
-training.TorchMLP = TorchMLP     #models saved before this file existed point to training.TorchMLP: lets them load
+training.TorchMLP = TorchMLP     #loads old models
 
 
-# ---------------------------------------------------------------- the MLP
-MLP_HIDDEN = 256
+MLP_HIDDEN = 256 #width of hidden layer
 MLP_LAYERS = 2
 MLP_DROPOUT = 0.2
-MLP_LR = 1e-3
+MLP_LR = 1e-3           #adam learning rate
 MLP_EPOCHS = 100
 MLP_PATIENCE = 10       #stop after this many epochs with no val improvement
 MLP_BATCH = 1024
 
 
 def fit_torch_mlp(train, val, y_mean, y_std, hidden=MLP_HIDDEN, layers=MLP_LAYERS, dropout=MLP_DROPOUT, lr=MLP_LR):
-    torch.manual_seed(0)
+    torch.manual_seed(0)  #allows for outcome reproducability
     x_mean, x_std = train["X"].mean(axis=0), train["X"].std(axis=0)     #input scaling learnt on train only
     x_std[x_std < 1e-8] = 1.0
-    to_t = lambda a: torch.as_tensor(a, dtype=torch.float32)
+    to_t = lambda a: torch.as_tensor(a, dtype=torch.float32)            #turns into tensor
     X_tr, X_va = to_t((train["X"] - x_mean) / x_std), to_t((val["X"] - x_mean) / x_std)
     y_tr, y_va = to_t((train["y"] - y_mean) / y_std), to_t((val["y"] - y_mean) / y_std)
 
@@ -65,31 +55,33 @@ def fit_torch_mlp(train, val, y_mean, y_std, hidden=MLP_HIDDEN, layers=MLP_LAYER
     best_mse, best_state, best_epoch = np.inf, None, 0
     for epoch in range(1, MLP_EPOCHS + 1):
         net.train()
-        for idx in torch.randperm(len(X_tr)).split(MLP_BATCH):         #shuffled mini-batches
-            opt.zero_grad()
-            loss = loss_fn(net(X_tr[idx]), y_tr[idx])
-            loss.backward()
-            opt.step()
-        net.eval()
+        for idx in torch.randperm(len(X_tr)).split(MLP_BATCH):         #shuffled mini-batches cut into branches
+            opt.zero_grad()                                            #standard SGD
+            loss = loss_fn(net(X_tr[idx]), y_tr[idx])                  #....
+            loss.backward()                                            #....
+            opt.step()                                                 #.....
+        net.eval()                                                     #score on evaluation set
         with torch.no_grad():
             val_mse = float(loss_fn(net(X_va), y_va))
-        if val_mse < best_mse:                                           #keep the best epoch on the val split
+        if val_mse < best_mse:                                           #keep the best epoch on the validation split
             best_mse, best_epoch = val_mse, epoch
             best_state = {k: v.clone() for k, v in net.state_dict().items()}
         elif epoch - best_epoch >= MLP_PATIENCE:
             break
 
-    net.load_state_dict(best_state)
-    return TorchMLP(net, x_mean, x_std), {"select_nmse": best_mse, "best_epoch": best_epoch,
+    net.load_state_dict(best_state)  #best epoch weight restored not last epoch
+    return TorchMLP(net, x_mean, x_std), {"select_nmse": best_mse, "best_epoch": best_epoch,                #becomes columns in the result csv
                                           "hidden": hidden, "layers": layers, "dropout": dropout, "lr": lr,
                                           "n_params": int(sum(p.numel() for p in net.parameters()))}
+    #val used for both early stopping and model selectoin, final numbers come from test split in eval
 
-
-# ---------------------------------------------------------------- training run (Noah's training.run + extra pools)
 def load_train(dataset, extra_pools=()):
     #train split of main, plus every episode of each extra pool (e.g. dart); val/test stay main only
-    parts = [load_dataset("main", dataset, load_splits("train"))] + [load_dataset(pool, dataset) for pool in extra_pools]
-    train = {k: np.concatenate([p[k] for p in parts]) for k in ("X", "y", "episode_id", "phase")}
+    parts = [load_dataset("main", dataset, load_splits("train")),
+            *(load_dataset(pool, dataset) for pool in extra_pools)
+        ]
+    keys = ("X", "y", "episode_id", "phase")
+    train = {k: np.concatenate([p[k] for p in parts]) for k in keys}
     train["feature_names"], train["label_names"] = parts[0]["feature_names"], parts[0]["label_names"]
     return train
 
@@ -98,7 +90,7 @@ def run_mlp(dataset, model_name, extra_pools=(), **hp):
     #same steps and results row as training.run, but trains on main train + extra_pools and passes hp to fit_torch_mlp
     train = load_train(dataset, extra_pools)
     val = load_dataset("main", dataset, load_splits("val"))
-    y_mean, y_std = scale_labels(train["y"])
+    y_mean, y_std = scale_labels(train["y"]) #computes label mean and std on combined training set with scaled labels (all labels count the same)
     t0 = time.perf_counter()
     model, info = fit_torch_mlp(train, val, y_mean, y_std, **hp)
     fit_s = time.perf_counter() - t0
@@ -113,22 +105,22 @@ def run_mlp(dataset, model_name, extra_pools=(), **hp):
     row = {"model": model_name, "dataset": dataset, **info, "fit_s": round(fit_s, 2),
            "infer_us": time_single_row(bundle, val["X"][0]), "train_rows": len(train["X"]), "val_rows": len(val["X"]),
            **metrics(val["y"], pred, y_std, train["label_names"], "val_")}
-    if dataset.startswith("arm"):                              #also score on the full torque sent (as Noah does)
+    if dataset.startswith("arm"):                              #also score on the full torque sent
         raw_train = load_dataset("main", "arm", load_splits("train"))
         raw_val = load_dataset("main", "arm", load_splits("val"))
         tau_g = raw_val["y"] - val["y"] if bundle["residual"] else 0.0
         full = np.clip(pred + tau_g, -TORQUE_LIMIT, TORQUE_LIMIT)
         row.update(metrics(raw_val["y"], full, scale_labels(raw_train["y"])[1], raw_train["label_names"], "val_full_"))
     if dataset == "base":
-        e = ((pred - val["y"]) / y_std) ** 2
+        e = ((pred - val["y"]) / y_std) ** 2 #error for every row
         for phase in np.unique(val["phase"]):
-            row[f"val_nmse_{phase}"] = float(e[val["phase"] == phase].mean())
+            row[f"val_nmse_{phase}"] = float(e[val["phase"] == phase].mean()) #urns the numpy number into a plain Python number for the val_nmse
 
     append_results(row)
     print(f"{model_name} {dataset:<10} val nmse {row['val_nmse']:.3f}  params {info['n_params']}  {row['infer_us']:.0f} µs/row")
 
 
-# ---------------------------------------------------------------- extra datasets for the policy that tracks q_des (EPolicy)
+#q_des policy tracker
 def build_e_datasets(pool, stride=10):
     #same rows as dataset_arm.npz:  dataset_arm_e.npz = arm inputs + e0..e6 -> torques,  dataset_qddes.npz = arm inputs -> qd_des0..6
     folder = os.path.join(DATA_DIR, pool)
@@ -162,10 +154,9 @@ def build_e_datasets(pool, stride=10):
         print(f"saved {out}: X {inputs.shape}, y {labels.shape}")
 
 
-# ---------------------------------------------------------------- DAgger
+#Dagger
 def make_dagger_pool(run_name, pool, stride=10):
-    #states from the model's own closed-loop run, labels = what the expert would have sent there (logged every step)
-    src, dst = os.path.join(OUT_DIR, "closed_loop", run_name), os.path.join(DATA_DIR, pool)
+    src, dst = os.path.join(OUT_DIR, "closed_loop", run_name), os.path.join(DATA_DIR, pool) #dst = destination
     os.makedirs(dst, exist_ok=True)
     files = sorted(glob.glob(os.path.join(src, "ep*.parquet")))
     for f in files:
@@ -181,7 +172,7 @@ def make_dagger_pool(run_name, pool, stride=10):
         build_dataset(pool, model, stride, False)
 
 
-# ---------------------------------------------------------------- settings
+#settings
 STEP = "train"
 E_POOLS = ("main", "dart", "dart2")                  #e_datasets
 DAGGER_RUN, DAGGER_POOL = "dagger_r1", "dagger_r1"   #dagger_pool: closed-loop NAME -> new data/<pool>/
