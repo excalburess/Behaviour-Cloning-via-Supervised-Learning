@@ -298,8 +298,10 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
                 "target_x": target[0], "target_y": target[1], "target_z": target[2],
                 "ee_x": ee_pos[0], "ee_y": ee_pos[1], "ee_z": ee_pos[2],                       
                 "shoulder_x": shoulder_pos[0], "shoulder_y": shoulder_pos[1], "shoulder_z": shoulder_pos[2],  
-                **{f"q{i}": q_mes[4 + i] for i in range(7)},                                 
-                **{f"tau_g{i}": tau_g[i] for i in range(7)},
+                 **{f"q{i}": q_mes[4 + i] for i in range(7)},
+                 **{f"qd{i}": qd_mes[4 + i] for i in range(7)},
+                 **{f"lim_margin{i}": lim_margin[i] for i in range(7)},
+                 **{f"tau_g{i}": tau_g[i] for i in range(7)},
             }
             if policy.drives_base and not base_navigation_done:
                 policy_wheels = policy.wheel_cmds(state)
@@ -451,7 +453,7 @@ def run_episode(target, start_xy, start_yaw, start_arm_offset, seed, noise_seed=
         "nav_done_time": nav_done_time,
         "nav_timed_out": nav_done_time is not None and nav_done_time >= BASE_NAV_TIMEOUT,
         "n_steps": step, "sim_duration": current_time,
-        "max_finger_dev": float(np.max(np.abs(q_mes[11:17] - target_finger_angles))),
+        "max_finger_dev": float(np.max(np.abs(q_mes[11:17] - target_finger_angles))),                                           #max finger 
         **{f"applied_offset{i}": applied_offset[i] for i in range(7)},
         "floor_friction": floor_friction,
         "n_rows": len(df),

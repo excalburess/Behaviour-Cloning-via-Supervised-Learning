@@ -12,13 +12,17 @@ from training import predict_physical, load_splits, MODEL_DIR, OUT_DIR, DATA_DIR
 #Settings per model
 NAME = "ridge_arm_every_1"
 ARM_MODEL = os.path.join(MODEL_DIR, "ridge_arm.joblib")
-BASE_MODEL = None
+BASE_MODEL = os.path.join(MODEL_DIR, "ridge_base.joblib")
+POOL = "main" 
 SPLIT = "val"
 N_EPISODES = None
 WORKERS = 3
 GUI = True
 SAVE_STEPS = True
 POLICY_EVERY = 1 #rename
+ACT_NOISE = 0.0  
+FRICTION = 1.0           
+SENSOR_NOISE = 0.0
 
 
 
@@ -56,6 +60,25 @@ class Policy:
         self.arm_calls += 1
         return self.last_torques
 
+class SensorNoise:
+    def __init__(self, policy, q_std, seed=0):
+        self.policy, self.q_std, self.qd_std = policy, q_std, 5 * q_std
+        self.rng = np.random.default_rng(seed)
+        self.drives_arm, self.drives_base = policy.drives_arm, policy.drives_base
+    def noisy(self, state):
+        state = dict(state)
+        for i in range(7):
+            state[f"q{i}"] += self.rng.normal(0, self.q_std)
+            state[f"qd{i}"] += self.rng.normal(0, self.qd_std)
+        return state
+
+    def wheel_cmds(self, state):
+        return self.policy.wheel_cmds(self.noisy(state))
+
+    def arm_torques(self, state):
+        return self.policy.arm_torques(self.noisy(state))
+
+
 
 def run_one(job):
     row, arm_model, base_model, gui = job = job   #unpacks job tuple 
@@ -66,11 +89,14 @@ def run_one(job):
         #runs simulation
         from robotnik_arm_task import run_episode
         policy = Policy(arm_model, base_model)
+        if SENSOR_NOISE > 0:
+            policy = SensorNoise(policy, SENSOR_NOISE, seed=episode_id)
         df, summary = run_episode(
             target=[row["target_x"], row["target_y"], row["target_z"]],
             start_xy=[row["start_x"], row["start_y"]], start_yaw=float(row["start_yaw"]),
             start_arm_offset=np.array([row[f"arm_offset{i}"] for i in range(7)], dtype=float),
-            seed=episode_id, noise_std=0.0, headless=not gui, policy=policy)
+            seed=episode_id, noise_seed=episode_id + 100000, noise_std=ACT_NOISE,
+            floor_friction=FRICTION, headless=not gui, policy=policy)
         
         if SAVE_STEPS:
             #saves steps
@@ -87,7 +113,7 @@ def run_one(job):
 
 
 def compare_with_expert(model_runs):
-    expert = (pd.read_csv(os.path.join(DATA_DIR, "main", "summary.csv"),
+    expert = (pd.read_csv(os.path.join(DATA_DIR, POOL, "summary.csv"),
                           usecols=["episode_id", "stop_reason", "final_ee_error", "sim_duration"])
                 .drop_duplicates("episode_id", keep="last"))
     
@@ -111,8 +137,9 @@ def compare_with_expert(model_runs):
 
 
 if __name__ == "__main__":
-    plan = pd.read_csv(os.path.join(DATA_DIR, "main", "plan.csv"))
-    plan = plan[plan["episode_id"].isin(load_splits(SPLIT))] #checks if episodes in split of val and train and if so puts in plan
+    plan = pd.read_csv(os.path.join(DATA_DIR, POOL, "plan.csv"))
+    if POOL == "main":
+        plan = plan[plan["episode_id"].isin(load_splits(SPLIT))] #checks if episodes in split of val and train and if so puts in plan
     if GUI:
         plan = plan.head(1)
     elif N_EPISODES:
