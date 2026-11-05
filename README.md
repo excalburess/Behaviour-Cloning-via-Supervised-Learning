@@ -1,9 +1,7 @@
 # Behaviour Cloning via Supervised Learning (COMP0245)
 
-A model learns to imitate the expert controller of a Robotnik mobile base with a 7-joint Kinova arm. The robot drives to a target (red dot) and reaches it with its hand.
 
-- **Model inputs:** robot measurements + target position
-- **Model outputs:** `wheel_cmds` (4 wheel speeds) and `torque_arm` (7 joint torques)
+The projects is built to explore how different machine learning models can clone the behaviour of an expert controlling a robot, consisting of a driven base and an arm, to reach a target. A model learns to imitate the expert controller of a Robotnik mobile base with a 7-joint Kinova arm. The robot drives to a target (red dot) and reaches it with its hand.
 
 ---
 
@@ -47,6 +45,9 @@ A model learns to imitate the expert controller of a Robotnik mobile base with a
 ## 2. The whole pipeline at a glance
 
 Every step reads the previous step's files, so any step can be re-run on its own.
+This origional pipeline was then reconstructed for the MLP and GRU models.
+
+Origional Pipeline:
 
 | Step | Script | What it does | Main output |
 |---|---|---|---|
@@ -61,6 +62,11 @@ Every step reads the previous step's files, so any step can be re-run on its own
 | 8 | `closed_loop.py` | Lets a trained model drive the robot, compares with the expert | `outputs/closed_loop_<NAME>.csv` |
 | 9 | `test.py` | Plots one closed-loop run against the expert | `outputs/diagnose_*.png` |
 
+MLP Pipeline:
+
+Step 7 and step 8 can be replaced with mlp.py and mlp_eval.py if an MLP is being trained and tested.
+MLP uses a wrapper for a torch network so it can plug into policy and be used with the entire pipeline.
+Settings can be chosen at the top for the hyper parameters of the MLP. This file also contains the Epolicy which is used for the hidden reference calculation. MLP eval can be used instead of close_loop to run test using the trained MLP models. Cluade Code was used as an assit to help with this part of the project.
 ---
 
 ## Step 0: try the expert (optional)
@@ -249,6 +255,23 @@ It saves each model and scores it on the **val** split. The test split is not us
 | `ALPHAS` | Ridge penalty strengths to try (higher = smaller weights, less overfitting) |
 | `TORQUE_LIMIT` | torques are clipped to ±30 N·m when scored, as on the robot |
 
+
+**Run:** `pixi run python mlp.py`
+
+**What it does:** trains Multi-Layer Perceptron (MLP) neural network policies for both the base and arm models using the processed datasets. 
+- **Base MLP:** Learns wheel commands from relative target position, distance, bearing, and robot speeds.
+- **Arm MLP:** Learns joint torques (or residual torques) from relative target position, joint angles, joint speeds, and joint limit margins.
+
+It trains using mini-batch gradient descent, tracks validation loss, and saves the best model weights.
+
+| Setting | Meaning |
+|---|---|
+| `HIDDEN_SIZES` | Architecture of the hidden layers (e.g., `[128, 128]`) |
+| `LEARNING_RATE` | Step size for the optimizer (e.g., `1e-3`) |
+| `BATCH_SIZE` | Number of samples per training batch |
+| `EPOCHS` | Total number of passes over the training dataset |
+| `DROPOUT` | Regularization dropout rate (if applicable) |
+
 How to read `outputs/results_offline.csv`:
 
 | Column | Meaning |
@@ -290,6 +313,18 @@ How to read `outputs/results_offline.csv`:
 1. `GUI = True`: watch one episode.
 2. `GUI = False`, `N_EPISODES = 3`: check the table prints with no crashes.
 3. `N_EPISODES = None`: all 63 val episodes.
+
+**Run:** `pixi run python mlp_eval.py`
+
+**What it does:** evaluates trained Multi-Layer Perceptron (MLP) models in closed-loop simulation on specified dataset splits, comparing their success rate and tracking performance against the expert controller.
+
+| Setting | Meaning |
+|---|---|
+| `MODEL_PATH` | path to the saved MLP model weights (`.joblib` or `.pt`) |
+| `SPLIT` | dataset split to evaluate on (`"val"` or `"test"`) |
+| `GUI` | `True` = watch one episode in the 3D PyBullet window, `False` = headless execution |
+| `N_EPISODES` | `None` = run every episode of the split, or a specified integer for a quick test |
+| `WORKERS` | number of parallel simulation workers |
 
 ### How to read the printed table
 
