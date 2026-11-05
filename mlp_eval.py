@@ -17,7 +17,7 @@ from training import predict_physical, load_splits, MODEL_DIR, OUT_DIR, DATA_DIR
 from closed_loop import Policy                     
 from pipeline import make_inputs, LIMITED_JOINTS
 
-#what is "policy": the brain that maps our measurments to motion via the model instead of expert
+#policy is the brain that maps our measurments to motion via the model instead of expert
 
 MAX_Q_LEAD = 0.15     #furtherst expert's target joint angles are allowed to run ahead
 DT = 0.001            #simulation step (1 ms): the arm model must run every step
