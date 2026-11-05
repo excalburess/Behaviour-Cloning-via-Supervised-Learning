@@ -351,43 +351,129 @@ Rows: `expert` (from the collected data) and your model, on exactly the same epi
 
 ## GRU policy (`gru.py`)
 
-**Final model: `models/gru_e80.joblib`**
+**Final model: `models/gru_e80.joblib`** (Sam)
 
-A recurrent policy, built on the steps above in the same way as the MLP files (no pipeline file is edited). The base GRU drives until the base is parked, then the arm GRU reaches. Its memory lets it follow the expert's hidden state: the driving phase, and the arm's joint reference `q_des`, which the expert builds up over time.
+A recurrent policy built on top of the pipeline above, the same way the MLP files are (no pipeline file is edited). The base GRU drives until the base is parked, then the arm GRU takes over and reaches. The memory is there because the expert isn't a pure function of the current state: it switches between align / drive / orient while driving, and the arm controller builds up its own joint reference `q_des` over time. A single-step model can't see either of those.
 
-**Run:** set `STEP` at the bottom of `gru.py`, then `pixi run python gru.py`
+- **Inputs:** base = 10 features (target and parking pose relative to the robot, heading errors). Arm = 39 features (target, joint angles as sin/cos and raw, joint speeds, hand-to-target error).
+- **Outputs:** base = 2 wheel speeds (clipped to ±3.5 rad/s). Arm = 7 torques minus gravity (gravity added back at run time, clipped to ±30 N·m).
+- **Network (each):** 128 embedding → 1 GRU layer of 128 → 2×128 head that sees the memory and the current input. The memory updates every 10 ms; the head runs every 1 ms. 305k parameters in total (base 150k, arm 155k), 2.4 MB file.
+- **Training:** whole episodes as sequences (every 10th step), batches of 8 episodes, MSE on standardised labels with arm steps within 5 cm of the target weighted 3×, AdamW 1e-3 with cosine decay, weight decay 1e-5, gradient clip 1.0. Trains for a fixed number of epochs and keeps the epoch with the lowest val loss.
+- **Running it:** plain numpy, about 100 µs per step against the 1 ms control period. Torque is only needed for training.
 
-| `STEP` | What it does | Main output |
+### How to run
+
+Set the settings block at the **bottom of `gru.py`**, then `pixi run python gru.py`.
+
+| `STEP` | What it does | Output |
 |---|---|---|
-| `"pools"` | Plans and collects the pools `pipeline.py` does not define: `dart2` (500 episodes, noise 0.5) and `sel` (137 extra episodes for choosing models) | `data/dart2/`, `data/sel/` |
-| `"train"` | Trains the base and arm GRUs on `main` train + `EXTRA` pools, keeping the epoch with the best val loss | `models/<NAME>.joblib` |
-| `"closed_loop"` | Lets the GRU drive on `SPLIT` of `main`, or on another `POOL` (`sel`, `oor_*`), optionally with sensor noise, actuator noise or low friction | `outputs/closed_loop_<NAME>_<split or pool>.csv` |
-| `"report"` | Parameters, inference time, offline test NMSE, closed-loop numbers, loss curves | `outputs/gru_report.csv`, `outputs/gru_loss_curves_<NAME>.png` |
-| `"dagger"`, `"ensemble"` | Experiments that did not improve the final model (see below) | |
+| `"pools"` | Plans and collects the two pools `pipeline.py` doesn't define: `dart2` (500 episodes, DART noise 0.5) and `sel` (137 clean episodes only used to choose between models) | `data/dart2/`, `data/sel/` |
+| `"train"` | Trains the base and arm GRUs on `main` train + the `EXTRA` pools | `models/<NAME>.joblib` |
+| `"closed_loop"` | The model (or the expert, with `NAME = "expert"`) drives on `SPLIT` of `main`, or on another `POOL`, optionally with noise / low friction | `outputs/closed_loop_<NAME>_<split or pool><TAG>.csv` |
+| `"report"` | Size, inference time, offline test NMSE and closed-loop numbers, plus the loss curves | `outputs/gru_report.csv`, `outputs/gru_loss_curves_<NAME>.png` |
+| `"ablation"` | The development table in the report (offline NMSE + val / sel successes for each version) | `outputs/gru_ablation.csv` |
+| `"dagger"`, `"ensemble"` | The two experiments that didn't make it into the final model (see below) | `data/gru_dagger1/`, `models/<NAME>.joblib` |
 
-**Rebuild the final model** (after `pipeline.py` has collected `main` and `dart`, and `"pools"` has collected `dart2`):
+| Setting | Meaning |
+|---|---|
+| `NAME` | model name in `models/`; for `closed_loop` it can also be `"expert"` |
+| `EXTRA` | extra training pools, e.g. `["dart", "dart2"]` |
+| `EPOCHS` | epochs (the best val epoch is kept, there is no early stopping) |
+| `BASE_FROM` | copy the base GRU from this model and only train the arm (`None` = train both) |
+| `NEAR_WEIGHT`, `NEAR_DIST` | arm steps closer than `NEAR_DIST` m to the target count `NEAR_WEIGHT` times |
+| `SEED` | training seed (starting weights and batch order only) |
+| `SPLIT`, `POOL` | which episodes `closed_loop` uses: `SPLIT` of `main`, or `POOL = "sel"` / `"oor_far"` / `"oor_high"` / `"oor_start"` / `"oor_arm"` |
+| `SENSOR_NOISE`, `ACT_NOISE`, `FRICTION` | robustness conditions, same definitions as `mlp_eval.py` |
+| `TAG` | added to the output file name for robustness runs so the clean result isn't overwritten |
+| `WORKERS`, `GUI` | parallel simulators; `GUI = True` shows one episode in the window |
 
-| Run | `NAME` | `EXTRA` | `EPOCHS` | `BASE_FROM` |
-|---|---|---|---|---|
-| 1 | `"gru_dart2"` | `["dart", "dart2"]` | `40` | `None` |
-| 2 | `"gru_e80"` | `["dart", "dart2"]` | `80` | `"gru_dart2"` (arm only is retrained) |
+**Before you start:** `pipeline.py` needs to have collected `main`, `dart` and the four `oor_*` pools, and `splits.py` needs to have made the splits (steps 1–6 above). Then run `STEP = "pools"` once.
 
-**Results** (full table: `outputs/gru_vs_mlp.csv`, same episodes for both models):
+**To just watch it:** `pixi run python run_random.py` puts the target somewhere random and lets `gru_e80` drive in the pybullet window (settings at the top of the file, `POLICY = "expert"` to watch the expert).
 
-| Condition | GRU `gru_e80` | MLP `small_e_h128` |
+### Rebuilding every model in the report
+
+Run `"train"` with these settings, in this order (anything not listed is the default: `NEAR_WEIGHT, NEAR_DIST = 3.0, 0.05`, `SEED = 0`).
+
+| Model | `EXTRA` | `EPOCHS` | `BASE_FROM` | Other | Notes |
+|---|---|---|---|---|---|
+| `gru` | `["dart"]` | 40 | `None` | | first version, main + DART 150 |
+| `gru_dart2` | `["dart", "dart2"]` | 40 | `None` | | + DART 500 (650 DART episodes in total) |
+| `gru_nw10` | `["dart", "dart2"]` | 40 | `"gru_dart2"` | `NEAR_WEIGHT, NEAR_DIST = 10.0, 0.03` | 10× weight on the last 3 cm (discarded) |
+| **`gru_e80`** | `["dart", "dart2"]` | **80** | `"gru_dart2"` | | **final model** |
+| `gru_e80_s1`, `gru_e80_s2` | `["dart", "dart2"]` | 80 | `"gru_dart2"` | `SEED = 1` / `2` | only needed for the ensemble |
+| `gru_ens` | | | | `STEP = "ensemble"`, `MEMBERS` as in the file | mean of the three 80-epoch arms (discarded) |
+| `gru_dagger1` | `["dart", "dart2", "gru_dagger1"]` | 40 | `"gru_dart2"` | first run `STEP = "dagger"` with `NAME = "gru_dart2"` | DAgger round 1 (discarded) |
+
+All of these except the seed models are in `models/`, so you can skip training and go straight to `"closed_loop"`.
+
+### Rebuilding the results
+
+| Result (report) | Settings for `STEP = "closed_loop"` | File |
 |---|---|---|
-| test (63) | 60/63 (95.2%), 0.92 ± 0.41 cm | 60/63 (95.2%), 1.05 ± 0.83 cm |
-| val + sel (200) | 195/200 | 181/200 |
-| `oor_far` / `oor_high` / `oor_start` / `oor_arm` (30 each) | 30 / 12 / 29 / 28 | 28 / 6 / 28 / 27 |
-| sensor noise 0.005 / 0.02 rad | 62 / 61 of 63 | 60 / 61 of 63 |
-| actuator noise 0.5 / floor friction 0.5 | 47 / 62 of 63 | 45 / 60 of 63 |
+| Development table, val / sel | `NAME` = each model, `SPLIT = "val"`, then `POOL = "sel"` | `closed_loop_<model>_val.csv`, `_sel.csv` |
+| Development table, NMSE column | `STEP = "ablation"` | `gru_ablation.csv` |
+| Final test result | `NAME = "gru_e80"`, `SPLIT = "test"` | `closed_loop_gru_e80_test.csv` |
+| Out-of-range | `POOL = "oor_far"` / `"oor_high"` / `"oor_start"` / `"oor_arm"` | `closed_loop_gru_e80_oor_*.csv` |
+| Robustness, GRU | `SPLIT = "val"`, then one at a time: `ACT_NOISE = 0.25, TAG = "_act025"`; `ACT_NOISE = 0.5, TAG = "_act05"`; `FRICTION = 0.4, TAG = "_fr04"`; `SENSOR_NOISE = 0.005 / 0.01 / 0.02, TAG = "_sn005" / "_sn01" / "_sn02"` | `closed_loop_gru_e80_val_<tag>.csv` |
+| Robustness, expert | same, with `NAME = "expert"` (the expert reads the true state, so only actuator noise and friction apply) | `closed_loop_expert_val_<tag>.csv` |
+| Size / speed / loss curves | `STEP = "report"` | `gru_report.csv`, `gru_loss_curves_gru_e80.png` |
 
-**How it was chosen:** on val + `sel` (200 episodes), from training seeds, 40 vs 80 epochs, extra weight on the last 3 cm, and a 3-seed ensemble. Test was used once, for `gru_e80` only.
+Everything is deterministic: the same model on the same episode gives the same result every time.
+
+### Results
+
+**Final model** (`gru_e80`, test split used once at the end):
+
+| | GRU | Expert |
+|---|---|---|
+| Test success | 60/63 (95.2%) | 63/63 |
+| Test final error | 0.92 ± 0.41 cm | 0.86 ± 0.29 cm |
+| Val / sel (used to choose it) | 62/63, 133/137 | |
+
+**How it was chosen** (`outputs/gru_ablation.csv`): every version was compared on closed-loop success over 200 episodes (val 63 + `sel` 137), since 63 alone is too few to separate models that all score 90–95%. Lower offline NMSE didn't always mean better driving.
+
+| Version | Arm NMSE (test, offline) | Val (/63) | Sel (/137) |
+|---|---|---|---|
+| `gru` (main + DART 150) | 0.050 | 51 | – |
+| `gru_dart2` (+ DART 500) | 0.034 | 58 | 127 |
+| `gru_dagger1` (discarded) | 0.054 | 51 | 98 |
+| `gru_nw10` (discarded) | 0.047 | 58 | 130 |
+| **`gru_e80` (final)** | **0.027** | **62** | **133** |
+| `gru_ens` (discarded) | 0.024 | 61 | 132 |
+
+Retraining with a different seed moved the score by about ±5 of 200, so the ensemble and the 10× weighting weren't real improvements.
+
+**Generalisation** (30 episodes each, never seen in training):
+
+| Pool | GRU |
+|---|---|
+| `oor_far` (targets 2.5–3.5 m away) | 30/30 |
+| `oor_high` (targets 1.10–1.30 m high) | 12/30 |
+| `oor_start` (start 1.5–3.0 m out) | 29/30 |
+| `oor_arm` (arm offsets up to 0.5 rad) | 28/30 |
+
+**Robustness** (val, 63 episodes, expert rerun under the same conditions):
+
+| Condition | GRU | Expert |
+|---|---|---|
+| none | 62 | 63 |
+| actuator noise σ = 0.25 / 0.5 | 59 / 53 | 57 / 41 |
+| floor friction μ = 0.4 | 62 | 63 |
+| sensor noise σ = 0.005 / 0.01 / 0.02 rad | 62 / 62 / 63 | – |
+
+**Against the MLP** on the same test episodes: `outputs/gru_vs_mlp.csv` (the `test + ...` rows are earlier robustness runs on the test split, kept for that comparison).
 
 **Notes:**
-- **DAgger made it worse** (71.5% on `sel`, against 92.7% without it). The expert's torque depends on its own `q_des`, which winds up to its 0.15 rad limit while the GRU drives. The logged labels are then one long saturated push, not what the expert would do from that state.
-- **`dart2` settings are inferred.** The noise level (0.5) and IDs (710–1209) were rebuilt from `outputs/plan_dart2.png`; `sel` uses IDs 1210–1346.
-- **Inference** is plain numpy, about 100 µs per step against the 1 ms control period. The model has 305k parameters (base 150k + arm 155k).
+- **DAgger made it worse** (98/137 on `sel` against 127 without it). The expert's torque depends on its own `q_des`, which winds up to its 0.15 rad limit while the GRU is driving, so the labels it records are one long saturated push rather than what it would normally do from that state.
+- **The 6 slow test episodes** are ones where the base hit the 25 s navigation timeout and the arm then reached from wherever the base stopped. Mean time to reach is 11.8 s (10.0 s without those 6).
+- **`dart2` settings were rebuilt** from `outputs/plan_dart2.png`: noise 0.5, IDs 710–1209. `sel` uses IDs 1210–1346.
+
+### What's reused and what's new
+
+- **Used as is:** `robotnik_arm_task.run_episode` (the simulator and the expert, which also labels the DAgger data), `training.load_splits` and the folder constants, `pipeline.make_plan` / `collect_data` for the extra pools, and the trimming rule from `build_dataset`.
+- **Copied ideas, rewritten:** the parking-pose rule in `gru_inputs` is the one in `robotnik_arm_task.py`; the sensor-noise wrapper and conditions match Finn's `mlp_eval.py` so the two models get the same tests.
+- **Written from scratch:** everything else in `gru.py`: features, sequence building, the GRU model and training loop (torch `nn.GRU`), the numpy version used at run time, closed-loop runs, DAgger, ensemble, report/ablation, the extra pools, and `run_random.py`.
 
 ---
 

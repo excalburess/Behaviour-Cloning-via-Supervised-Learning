@@ -1,3 +1,20 @@
+"""GRU policy for the base and the arm (Sam).
+
+Same idea as the MLP but with memory. The expert isn't a pure function of the current state: the base goes through
+align / drive / orient phases, and the arm controller builds up its own joint reference q_des over time (clipped to
+0.15 rad ahead of q). A GRU keeps a hidden state through the episode, so it can pick up that history itself instead
+of us having to hand-craft it as an input.
+
+Two networks, both the same shape:
+    e_t = SiLU(W x_t + b)            embedding of the current features
+    h_k = GRU(e_k, h_{k-1})          memory, only updated every STRIDE calls (10 ms, same spacing as the training rows)
+    y_t = MLP([h_k, e_t])            head, run on every call (1 ms) so the command still reacts to the latest state
+Base: 10 features -> 2 wheel speeds. Arm: 39 features -> 7 torques minus gravity (gravity is added back at run time).
+Training is done in torch, but the policy itself runs in plain numpy (about 0.1 ms a step).
+
+Run it by setting STEP at the bottom and then:  pixi run python gru.py
+The README has the exact settings for every model in the report.
+"""
 import os
 import glob
 import time
@@ -9,8 +26,8 @@ from tqdm import tqdm
 from robotnik_arm_task import STANDOFF_Z_POINTS, STANDOFF_POINTS, ARM_REACH_LIMIT, TORQUE_LIMIT
 from training import load_splits, MODEL_DIR, OUT_DIR, DATA_DIR
 
-STRIDE = 10             #memory update period in calls 
-MAX_WHEEL = 3.5         #the expert never goes above 3 rad/s
+STRIDE = 10             #memory update period in calls (1 call = 1 ms)
+MAX_WHEEL = 3.5         #wheel speed clip, the expert never goes above 3 rad/s
 
 BASE_FEATURES = ["tgt_rel_x", "tgt_rel_y", "tgt_z", "goal_rel_x", "goal_rel_y", "goal_dist",
                  "goal_heading_sin", "goal_heading_cos", "final_bearing_err_sin", "final_bearing_err_cos"]
@@ -18,26 +35,27 @@ ARM_FEATURES = (["tgt_rel_x", "tgt_rel_y", "tgt_z"] + [f"q_sin{i}" for i in rang
                 + [f"q{i}" for i in range(7)] + [f"qd{i}" for i in range(7)]
                 + ["ee_err_x", "ee_err_y", "ee_err_z", "ee_err_norm", "reach_err_x", "reach_err_y", "reach_err_z",
                    "reach_err_norm"])
-BASE_LABELS = ["cmd_wheel0", "cmd_wheel1"]                      
-ARM_LABELS = [f"tau{i}_minus_g" for i in range(7)]              
+BASE_LABELS = ["cmd_wheel0", "cmd_wheel1"]                      #right and left wheel (the other two copy these)
+ARM_LABELS = [f"tau{i}_minus_g" for i in range(7)]              #torque minus gravity, easier to learn
 
-# features (same code for logged data and live state)
+
+#features: the same function is used on the logged data and on the live state, so they can't drift apart
 def wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
-def gru_inputs(d):         
+def gru_inputs(d):
+    #d is a dataframe (training) or a state dict (run time)
     g = lambda k: np.atleast_1d(np.asarray(d[k], dtype=np.float64))
     yaw, bx, by = g("base_yaw"), g("base_x"), g("base_y")
     tx, ty, tz = g("target_x"), g("target_y"), g("target_z")
     c, s = np.cos(yaw), np.sin(yaw)
-    rot = lambda x, y: (c * x + s * y, -s * x + c * y)            #world -> robot frame
+    rot = lambda x, y: (c * x + s * y, -s * x + c * y)            #world frame -> robot frame
     X = {}
     X["tgt_rel_x"], X["tgt_rel_y"] = rot(tx - bx, ty - by)
     X["tgt_z"] = tz
 
-
-    #parking pose, same rule as robotnik_arm_task.py
+    #where the base should park, worked out with the same rule as robotnik_arm_task.py
     standoff = np.interp(tz, STANDOFF_Z_POINTS, STANDOFF_POINTS)
     goal_yaw = np.where(np.hypot(tx, ty) > 1e-4, np.arctan2(ty, tx), 0.0)
     gx, gy = tx - standoff * np.cos(goal_yaw), ty - standoff * np.sin(goal_yaw)
@@ -52,15 +70,14 @@ def gru_inputs(d):
         X[f"q_sin{i}"], X[f"q_cos{i}"] = np.sin(q[:, i]), np.cos(q[:, i])
         X[f"q{i}"], X[f"qd{i}"] = q[:, i], g(f"qd{i}")
 
-    #hand -> target, and the reach-limited version the expert's IK chases (far targets projected onto the sphere)
+    #hand -> target error, plus the version the expert's IK actually chases (targets out of reach are pulled
+    #back onto the reach sphere around the shoulder)
     ee = np.stack([g("ee_x"), g("ee_y"), g("ee_z")], axis=1)
     sh = np.stack([g("shoulder_x"), g("shoulder_y"), g("shoulder_z")], axis=1)
     tgt = np.stack([tx, ty, tz], axis=1)
     off = tgt - sh
     n = np.linalg.norm(off, axis=1, keepdims=True)
     off = np.where(n > ARM_REACH_LIMIT, off * ARM_REACH_LIMIT / np.maximum(n, 1e-9), off)
-
-
     for name, err in (("ee_err", tgt - ee), ("reach_err", sh + off - ee)):
         X[f"{name}_x"], X[f"{name}_y"] = rot(err[:, 0], err[:, 1])
         X[f"{name}_z"] = err[:, 2]
@@ -76,8 +93,8 @@ def gru_labels(df):
 
 
 def load_sequences(pool, ids=None):
-    #one (base, arm) pair of sequences per episode: driving rows / reaching rows, every STRIDE-th 1 ms row.
-    #DAgger pools (name contains "dagger") are not trimmed: their stalls, labelled by the expert, are the point
+    #each episode gives one base sequence (rows while driving) and one arm sequence (rows after parking),
+    #keeping every STRIDE-th 1 ms row. DAgger pools aren't trimmed, since the stalls are exactly what we want labelled
     folder = os.path.join(DATA_DIR, pool)
     trim = "dagger" not in pool
     reasons = pd.read_csv(os.path.join(folder, "summary.csv")).drop_duplicates(
@@ -88,7 +105,7 @@ def load_sequences(pool, ids=None):
         if (ids is not None and eid not in ids) or reasons.get(eid) in (None, "crash"):
             continue
         df = pd.read_parquet(f)
-        if trim and reasons.get(eid) in ("unreachable", "step_cap"):  #trimmed like Noah's build_dataset
+        if trim and reasons.get(eid) in ("unreachable", "step_cap"):  #cut where it stopped improving, like build_dataset
             err = np.linalg.norm(df[["ee_x", "ee_y", "ee_z"]].to_numpy()
                                  - df[["target_x", "target_y", "target_z"]].to_numpy(), axis=1)
             df = df.iloc[: int(np.argmax(err <= err.min() + 0.002)) + 1]
@@ -104,7 +121,7 @@ def load_sequences(pool, ids=None):
     return base, arm
 
 
-#training (torch)
+#training (torch is only imported in here, running the policy doesn't need it)
 def build_net(n_in, n_out, hidden):
     import torch
     from torch import nn
@@ -120,14 +137,14 @@ def build_net(n_in, n_out, hidden):
         def forward(self, x):
             e = self.emb(x)
             g, _ = self.gru(e)
-            return self.head(torch.cat((g, e), dim=-1))
+            return self.head(torch.cat((g, e), dim=-1))   #head sees the memory and the current input
 
     return GRUNet()
 
 
 def fit_gru(name, train, val, feature_names, label_names, hidden, epochs, batch, lr, near_weight, near_dist, seed=0):
-    #train, val: lists of (X, y, ee_err_norm) sequences. Full episodes, zero initial memory (as at run time), padded
-    #and masked; reaching rows within near_dist of the target weighted near_weight (the last centimetre matters most)
+    #train / val are lists of (X, y, ee_err_norm) sequences. Whole episodes from a zero memory, same as at run time,
+    #padded and masked. Arm rows closer than near_dist to the target count near_weight times as much
     import torch
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -139,7 +156,7 @@ def fit_gru(name, train, val, feature_names, label_names, hidden, epochs, batch,
         T = max(len(seqs[i][0]) for i in idx)
         X = np.zeros((len(idx), T, len(x_mean)), np.float32)
         Y = np.zeros((len(idx), T, len(y_mean)), np.float32)
-        W = np.zeros((len(idx), T), np.float32)
+        W = np.zeros((len(idx), T), np.float32)                    #0 on padding, so it doesn't count
         for b, i in enumerate(idx):
             x, y, near = seqs[i]
             X[b, :len(x)], Y[b, :len(x)] = (x - x_mean) / x_std, (y - y_mean) / y_std
@@ -152,7 +169,7 @@ def fit_gru(name, train, val, feature_names, label_names, hidden, epochs, batch,
     net = build_net(len(x_mean), len(y_mean), hidden)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
-    order = np.argsort([len(s[0]) for s in train])                 #similar lengths per batch: little padding
+    order = np.argsort([len(s[0]) for s in train])                 #batch episodes of similar length, less padding
     groups = [order[i:i + batch] for i in range(0, len(order), batch)]
     val_groups = [list(range(i, min(i + batch, len(val)))) for i in range(0, len(val), batch)]
     print(f"[{name}] {sum(p.numel() for p in net.parameters())} parameters, {len(train)} train / {len(val)} val episodes")
@@ -174,7 +191,7 @@ def fit_gru(name, train, val, feature_names, label_names, hidden, epochs, batch,
         with torch.no_grad():
             parts = [loss(net, *batches(val, g)) for g in val_groups]
             val_mse = float(sum(n for n, _ in parts) / sum(d for _, d in parts))
-        if val_mse < best:                                         #keep the best epoch on the val split
+        if val_mse < best:                                         #no patience rule, just keep the best val epoch
             best, best_state = val_mse, {k: v.clone() for k, v in net.state_dict().items()}
         history.append({"epoch": epoch, "train_mse": tr_num / tr_den, "val_mse": val_mse})
         print(f"[{name}] epoch {epoch:3d} train {tr_num / tr_den:.4f} val {val_mse:.4f} (best {best:.4f}) "
@@ -188,12 +205,13 @@ def fit_gru(name, train, val, feature_names, label_names, hidden, epochs, batch,
 
 def train(name, extra_pools, hidden=128, epochs=40, batch=8, lr=1e-3, near_weight=3.0, near_dist=0.05, seed=0,
           base_from=None):
-    #base_from: name of a saved model whose base GRU is reused as is (DAgger rounds only retrain the arm)
+    #base_from = an existing model whose base GRU gets copied over, so only the arm is retrained
+    #(the base was already fine at 40 epochs, so there was no point training it again)
     tr_ids, va_ids = set(load_splits("train")), set(load_splits("val"))
     base_tr, arm_tr = load_sequences("main", tr_ids)
     base_va, arm_va = load_sequences("main", va_ids)
 
-    for pool in extra_pools:                   #DART / DAgger pools: training only
+    for pool in extra_pools:                   #DART / DAgger pools only ever go into training
         b, a = load_sequences(pool)
         base_tr, arm_tr = base_tr + b, arm_tr + a
     base = (joblib.load(os.path.join(MODEL_DIR, f"{base_from}.joblib"))["base"] if base_from else
@@ -208,7 +226,7 @@ def train(name, extra_pools, hidden=128, epochs=40, batch=8, lr=1e-3, near_weigh
 
 
 def ensemble(name, members):
-    #one model file whose arm is the mean of the members' arm GRUs (base GRU from the first member)
+    #saves one model file whose arm command is the average of the members' arm GRUs (base from the first member)
     ms = [joblib.load(os.path.join(MODEL_DIR, f"{n}.joblib")) for n in members]
     model = {**ms[0], "arm_members": [m["arm"] for m in ms], "members": list(members)}
     path = os.path.join(MODEL_DIR, f"{name}.joblib")
@@ -216,8 +234,9 @@ def ensemble(name, members):
     print(f"saved {path}")
 
 
+#running the policy (numpy only, rebuilt from the torch weights)
 def _silu(h):
-    return h * 0.5 * (1.0 + np.tanh(0.5 * h))                      #overflow-free h * sigmoid(h)
+    return h * 0.5 * (1.0 + np.tanh(0.5 * h))                      #h * sigmoid(h), written with tanh so it can't overflow
 
 
 def _sigmoid(h):
@@ -228,7 +247,7 @@ class _GRUNumpy:
     def __init__(self, m):
         w, H = m["weights"], m["hidden"]
         self.emb = (w["emb.0.weight"], w["emb.0.bias"])
-        self.Wi = [w["gru.weight_ih_l0"][k * H:(k + 1) * H] for k in range(3)]      #torch gate order: reset, update, new
+        self.Wi = [w["gru.weight_ih_l0"][k * H:(k + 1) * H] for k in range(3)]      #torch stores gates as reset, update, new
         self.Wh = [w["gru.weight_hh_l0"][k * H:(k + 1) * H] for k in range(3)]
         self.bi = [w["gru.bias_ih_l0"][k * H:(k + 1) * H] for k in range(3)]
         self.bh = [w["gru.bias_hh_l0"][k * H:(k + 1) * H] for k in range(3)]
@@ -237,7 +256,7 @@ class _GRUNumpy:
 
     def __call__(self, x, update):
         e = _silu(self.emb[0] @ ((x - self.m["x_mean"]) / self.m["x_std"]) + self.emb[1])
-        if update:
+        if update:                                                 #same equations as torch.nn.GRU
             r = _sigmoid(self.Wi[0] @ e + self.bi[0] + self.Wh[0] @ self.h + self.bh[0])
             z = _sigmoid(self.Wi[1] @ e + self.bi[1] + self.Wh[1] @ self.h + self.bh[1])
             n = np.tanh(self.Wi[2] @ e + self.bi[2] + r * (self.Wh[2] @ self.h + self.bh[2]))
@@ -248,8 +267,8 @@ class _GRUNumpy:
         return (self.head[-1][0] @ h + self.head[-1][1]) * self.m["y_std"] + self.m["y_mean"]
 
 
-class _Ensemble: #internal class helper
-    #several arm GRUs (different training seeds), each with its own memory; the command is their mean
+class _Ensemble:
+    #a few arm GRUs (different training seeds), each keeping its own memory; the command is their mean
     def __init__(self, members):
         self.nets = [_GRUNumpy(a) for a in members]
 
@@ -258,7 +277,7 @@ class _Ensemble: #internal class helper
 
 
 class GRUPolicy:
-    #same interface as MLP policy
+    #same interface as the MLP policy, so run_episode can use either
     def __init__(self, model_path, drives_base=True, drives_arm=True):
         m = joblib.load(model_path)
         self.stride = m["stride"]
@@ -283,8 +302,8 @@ class GRUPolicy:
 
 
 class SensorNoise:
-    #robustness test, same as Finn's (mlp_eval.py): the policy sees noisy joint readings (std q_std on q, 5x on qd);
-    #the simulator and the expert still use the true state
+    #robustness test, done the same way as Finn's in mlp_eval.py: the policy gets noisy joint readings
+    #(std q_std on q and 5x that on qd) but the simulator still uses the true state
     def __init__(self, policy, q_std, seed=0):
         self.policy, self.q_std, self.qd_std = policy, q_std, 5 * q_std
         self.rng = np.random.default_rng(seed)
@@ -304,7 +323,7 @@ class SensorNoise:
         return self.policy.arm_torques(self.noisy(state))
 
 
-#run one job
+#closed loop: the policy (or the expert, when model_path is None) actually drives the robot in the sim
 def run_one(job):
     row, model_path, drives_base, drives_arm, noise_std, save_folder, gui, sensor_noise, friction = job
     os.environ["ROBOENV_HEADLESS"] = "0" if gui else "1"
@@ -312,8 +331,8 @@ def run_one(job):
     start = time.perf_counter()
     try:
         from robotnik_arm_task import run_episode
-        policy = GRUPolicy(model_path, drives_base, drives_arm)
-        if sensor_noise > 0:
+        policy = GRUPolicy(model_path, drives_base, drives_arm) if model_path else None
+        if policy and sensor_noise > 0:
             policy = SensorNoise(policy, sensor_noise, seed=eid)
         df, summary = run_episode(
             target=[row["target_x"], row["target_y"], row["target_z"]],
@@ -330,7 +349,8 @@ def run_one(job):
     return summary
 
 
-def run_many(jobs, workers, gui): #runs multiple workers at the same time
+def run_many(jobs, workers, gui):
+    #one episode per worker process at a time (pybullet doesn't like sharing a process)
     if gui or workers == 1:
         return [run_one(j) for j in tqdm(jobs)]
     with mp.get_context("spawn").Pool(workers, maxtasksperchild=1) as pool:
@@ -339,32 +359,33 @@ def run_many(jobs, workers, gui): #runs multiple workers at the same time
 
 def closed_loop(name, split, workers, gui=False, drives_base=True, drives_arm=True, n_episodes=None, pool="main",
                 sensor_noise=0.0, act_noise=0.0, friction=1.0, tag=""):
+    #name = a model in models/, or "expert" to rerun the expert itself (used for the robustness comparison).
+    #tag is added to the file name so robustness runs don't overwrite the clean one, e.g. "_act025"
     plan = pd.read_csv(os.path.join(DATA_DIR, pool, "plan.csv"))
-
     if pool == "main":
         plan = plan[plan["episode_id"].isin(load_splits(split))]
-
     plan = plan.head(1) if gui else (plan.head(n_episodes) if n_episodes else plan)
-    model_path = os.path.join(MODEL_DIR, f"{name}.joblib")
+    model_path = None if name == "expert" else os.path.join(MODEL_DIR, f"{name}.joblib")
 
     run_name = (f"{name}_{split if pool == 'main' else pool}" + ("" if drives_base else "_arm")
                 + ("" if drives_arm else "_base") + tag)
-    
+    who = "expert" if model_path is None else "GRU"
     print(f"{run_name}: {len(plan)} {split if pool == 'main' else pool} episodes | base: "
-          f"{'GRU' if drives_base else 'expert'} | arm: {'GRU' if drives_arm else 'expert'} | sensor noise "
+          f"{who if drives_base else 'expert'} | arm: {who if drives_arm else 'expert'} | sensor noise "
           f"{sensor_noise}, act noise {act_noise}, friction {friction}")
-    
     jobs = [(row, model_path, drives_base, drives_arm, act_noise, None, gui, sensor_noise, friction)
             for row in plan.to_dict("records")]
     runs = pd.DataFrame(run_many(jobs, workers, gui))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     runs.to_csv(os.path.join(OUT_DIR, f"closed_loop_{run_name}.csv"), index=False)
-    #the expert's own run of the same episodes 
+
+    #printed next to the expert's original (clean) run of the same episodes. For a robustness run the fair
+    #comparison is the expert under the same conditions, which is what name="expert" + the same tag gives
     expert = pd.read_csv(os.path.join(DATA_DIR, pool, "summary.csv")).drop_duplicates("episode_id", keep="last")
     expert = expert[expert["episode_id"].isin(runs["episode_id"])]
     table = []
-    for who, r in (("expert", expert), (run_name, runs)):
+    for who, r in (("expert (clean)", expert), (run_name, runs)):
         reached = r["stop_reason"] == "reached"
         table.append({"who": who, "episodes": len(r), "success": reached.mean(),
                       "final_error_cm_mean": 100 * r["final_ee_error"].mean(),
@@ -377,7 +398,9 @@ def closed_loop(name, split, workers, gui=False, drives_base=True, drives_arm=Tr
     return runs
 
 
-def dagger(name, pool, workers, noise_std=0.0): #generates dagger pool
+def dagger(name, pool, workers, noise_std=0.0):
+    #the GRU drives the main train episodes and every step is logged with what the expert would have commanded,
+    #giving a new data pool. (It didn't help in the end, see the README)
     folder = os.path.join(DATA_DIR, pool)
     os.makedirs(folder, exist_ok=True)
     plan = pd.read_csv(os.path.join(DATA_DIR, "main", "plan.csv"))
@@ -391,13 +414,12 @@ def dagger(name, pool, workers, noise_std=0.0): #generates dagger pool
     pd.concat([old, pd.DataFrame(run_many(jobs, workers, False))]).to_csv(summary_csv, index=False)
 
 
-
-EXTRA_POOLS = [("dart2", 710, 500, "train", 0.5),     #second DART pool 
-               ("sel", 1210, 137, "train", 0.0)]      #extra selection episodes
+#pools that pipeline.py doesn't define: (name, first episode id, how many, ranges, DART noise)
+EXTRA_POOLS = [("dart2", 710, 500, "train", 0.5),     #second, bigger DART pool
+               ("sel", 1210, 137, "train", 0.0)]      #extra clean episodes, only used to pick between models
 
 
 def make_pools(workers):
-    #plans to collect extra data pools when necessary
     import pipeline
     for name, first, n, ranges, noise in EXTRA_POOLS:
         path = os.path.join(DATA_DIR, name, "plan.csv")
@@ -407,10 +429,10 @@ def make_pools(workers):
         pipeline.collect_data(name, workers)
 
 
-# VALIDATOIN METRICS
+#results
 def offline_mse(net_models, seqs):
-    #standardised MSE on held-out sequences (= NMSE: labels are scaled by the train std), memory reset per episode.
-    #net_models: one network, or the members of an ensemble (prediction = their mean)
+    #MSE on standardised labels (= NMSE, since labels are divided by the train std), memory reset each episode.
+    #net_models is a list: one network, or the members of an ensemble (prediction = their mean)
     num, den = 0.0, 0
     for X, Y, _ in seqs:
         net = _Ensemble(net_models)
@@ -421,7 +443,7 @@ def offline_mse(net_models, seqs):
 
 
 def inference_us(model_path, n=2000):
-    #Inference time+ feature time
+    #time for one policy call in microseconds, feature calculation included, on logged states from a test episode
     eid = int(load_splits("test")[0])
     df = pd.read_parquet(os.path.join(DATA_DIR, "main", f"ep{eid:05d}.parquet"))
     out = {}
@@ -437,7 +459,7 @@ def inference_us(model_path, n=2000):
 
 
 def report(rows):
-    #rows: (model name, val run, test run). Prints and saves outputs/gru_report.csv
+    #rows: (model, val run, test run). Size, speed, offline NMSE and closed-loop results -> outputs/gru_report.csv
     test_ids = set(load_splits("test"))
     base_te, arm_te = load_sequences("main", test_ids)
     table = []
@@ -466,8 +488,28 @@ def report(rows):
     print("saved outputs/gru_report.csv")
 
 
+def ablation(models):
+    #the development table in the report: offline NMSE on test plus closed-loop successes on val (63) and sel (137).
+    #Only val + sel were used to choose the model, so closed-loop test results aren't included here
+    base_te, arm_te = load_sequences("main", set(load_splits("test")))
+    rows = []
+    for name in models:
+        m = joblib.load(os.path.join(MODEL_DIR, f"{name}.joblib"))
+        arms = m.get("arm_members") or [m["arm"]]
+        r = {"model": name, "test_nmse_base": offline_mse([m["base"]], base_te),
+             "test_nmse_arm": offline_mse(arms, arm_te)}
+        for split in ("val", "sel"):
+            p = os.path.join(OUT_DIR, f"closed_loop_{name}_{split}.csv")
+            r[f"{split}_ok"] = int((pd.read_csv(p)["stop_reason"] == "reached").sum()) if os.path.exists(p) else None
+        rows.append(r)
+    t = pd.DataFrame(rows)
+    print(t.round(4).to_string(index=False))
+    t.to_csv(os.path.join(OUT_DIR, "gru_ablation.csv"), index=False)
+    print("saved outputs/gru_ablation.csv")
+
+
 def plot_curves(name):
-    #Fig. 2: train and val loss per epoch, base and arm GRU (standardised MSE; arm train loss is near-weighted)
+    #train and val loss per epoch for the base and arm GRU (arm train loss includes the near-target weighting)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -501,28 +543,33 @@ def plot_curves(name):
     print(f"saved {out}")
 
 
-# Settings #
-STEP = "closed_loop"
-NAME = "gru_e80"                    #models/<NAME>.joblib (final model)
-EXTRA = ["dart", "dart2"]           #extra training pools, e.g. ["dart", "dart2", "gru_dagger1"]
-EPOCHS = 80                         #train: 40 for the base (gru_dart2), 80 for the final arm
-BASE_FROM = "gru_dart2"             #train: reuse the base GRU of this saved model (None = train the base too)
-SPLIT = "val"                       #closed_loop: "val" while developing, "test" only for final results
-POOL = "main"                       #closed_loop: "main" (SPLIT episodes), "sel" (extra selection episodes) or oor_*
-SENSOR_NOISE, ACT_NOISE, FRICTION = 0.0, 0.0, 1.0   #closed_loop robustness conditions (as in mlp_eval.py)
+#settings (the README lists the values used for each model and run)
+STEP = "closed_loop"                #"pools", "train", "closed_loop", "dagger", "ensemble", "report" or "ablation"
+NAME = "gru_e80"                    #models/<NAME>.joblib, gru_e80 is the final model. closed_loop also takes "expert"
+EXTRA = ["dart", "dart2"]           #train: extra training pools, e.g. ["dart", "dart2", "gru_dagger1"]
+EPOCHS = 80                         #train: 40 for gru_dart2 (base + arm), 80 for the final arm
+BASE_FROM = "gru_dart2"             #train: copy the base GRU from this model (None = train the base as well)
+NEAR_WEIGHT, NEAR_DIST = 3.0, 0.05  #train: arm rows within NEAR_DIST m of the target count NEAR_WEIGHT times
+SEED = 0                            #train: only changes the starting weights and batch order
+SPLIT = "val"                       #closed_loop: "val" while developing, "test" only for the final results
+POOL = "main"                       #closed_loop: "main" (uses SPLIT), "sel", or one of the oor_* pools
+SENSOR_NOISE, ACT_NOISE, FRICTION = 0.0, 0.0, 1.0   #closed_loop robustness conditions (same as mlp_eval.py)
+TAG = ""                            #closed_loop: added to the output file name for robustness runs, e.g. "_act025"
 WORKERS = 8
-GUI = False
-DAGGER_POOL, DAGGER_NOISE = "gru_dagger1", 0.0      #dagger: new pool name; noise_std > 0 makes it a DART pool
-MEMBERS = ["gru_e80", "gru_e80_s1", "gru_e80_s2"]    #ensemble: models/<NAME>.joblib = mean of these arm GRUs
+GUI = False                         #True = watch one episode in the pybullet window
+DAGGER_POOL, DAGGER_NOISE = "gru_dagger1", 0.0      #dagger: name of the new pool (noise > 0 would make it DART)
+MEMBERS = ["gru_e80", "gru_e80_s1", "gru_e80_s2"]    #ensemble: arm GRUs to average into models/<NAME>.joblib
 REPORT = [("gru_dart2", "gru_dart2_val", "gru_dart2_test"),
           ("gru_e80", "gru_e80_val", "gru_e80_test")]                 #report: (model, val run, test run)
+ABLATION = ["gru", "gru_dart2", "gru_dagger1", "gru_nw10", "gru_e80", "gru_ens"]   #ablation: rows of the table
 
 if __name__ == "__main__":
     if STEP == "train":
-        train(NAME, EXTRA, epochs=EPOCHS, base_from=BASE_FROM)
+        train(NAME, EXTRA, epochs=EPOCHS, base_from=BASE_FROM, near_weight=NEAR_WEIGHT, near_dist=NEAR_DIST,
+              seed=SEED)
     elif STEP == "closed_loop":
         closed_loop(NAME, SPLIT, WORKERS, GUI, pool=POOL, sensor_noise=SENSOR_NOISE, act_noise=ACT_NOISE,
-                    friction=FRICTION)
+                    friction=FRICTION, tag=TAG)
     elif STEP == "dagger":
         dagger(NAME, DAGGER_POOL, WORKERS, DAGGER_NOISE)
     elif STEP == "pools":
@@ -532,3 +579,5 @@ if __name__ == "__main__":
     elif STEP == "report":
         report(REPORT)
         plot_curves(REPORT[-1][0])
+    elif STEP == "ablation":
+        ablation(ABLATION)
