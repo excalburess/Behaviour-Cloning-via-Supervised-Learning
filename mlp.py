@@ -81,7 +81,10 @@ def load_train(dataset, extra_pools=()):
             *(load_dataset(pool, dataset) for pool in extra_pools)
         ]
     keys = ("X", "y", "episode_id", "phase")
-    train = {k: np.concatenate([p[k] for p in parts]) for k in keys}
+    train = {}
+    for key in keys:
+        key_parts = [p[key] for p in parts]    #Gather key data for all parts
+        train[key] = np.concatenate(key_parts)
     train["feature_names"], train["label_names"] = parts[0]["feature_names"], parts[0]["label_names"]
     return train
 
