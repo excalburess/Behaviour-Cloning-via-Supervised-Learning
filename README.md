@@ -471,9 +471,8 @@ Retraining with a different seed moved the score by about ±5 of 200, so the ens
 
 ### What's reused and what's new
 
-- **Used as is:** `robotnik_arm_task.run_episode` (the simulator and the expert, which also labels the DAgger data), `training.load_splits` and the folder constants, `pipeline.make_plan` / `collect_data` for the extra pools, and the trimming rule from `build_dataset`.
-- **Copied ideas, rewritten:** the parking-pose rule in `gru_inputs` is the one in `robotnik_arm_task.py`; the sensor-noise wrapper and conditions match Finn's `mlp_eval.py` so the two models get the same tests.
-- **Written from scratch:** everything else in `gru.py`: features, sequence building, the GRU model and training loop (torch `nn.GRU`), the numpy version used at run time, closed-loop runs, DAgger, ensemble, report/ablation, the extra pools, and `run_random.py`.
+We edited: robotnik_arm_task.py to facilitate policy input and training as well as closed loop testing. Noah wrote: closed_loop.py, robotnik_arm_task.py, pipeline.py, splits.py, test.py and training.py as the base files. Used primarily a mix of tutorial from sci-kit learn, pandas, numpy and previous labs with minimal ai usage to create training pipeline and base for data generation. 
+
 
 ---
 
