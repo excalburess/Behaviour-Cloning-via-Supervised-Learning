@@ -473,6 +473,9 @@ Retraining with a different seed moved the score by about ±5 of 200, so the ens
 
 We edited: robotnik_arm_task.py to facilitate policy input and training as well as closed loop testing. Noah wrote: closed_loop.py, robotnik_arm_task.py, pipeline.py, splits.py, test.py and training.py as the base files. Used primarily a mix of tutorial from sci-kit learn, pandas, numpy and previous labs with minimal ai usage to create training pipeline and base for data generation. 
 
+Finn wrote mlp.py and mlp_eval.py, which were based off of Noah's pipeline files. mlp.py can be used instead of training.py to train the mlp models and mlp_eval.py can be used instead of closed loop to test the mlp policy with the error policy. Cluade Code was used as an assit to help with this part of the project.
+
+Sam wrote gru.py and ai tools was used to assist.
 
 ---
 
